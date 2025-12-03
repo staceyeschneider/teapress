@@ -174,6 +174,38 @@ def generate_search_reasoning(query, candidate_data, client):
     except Exception:
         return "Could not generate reasoning."
 
+# --- AUTHENTICATION ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["password"] == st.secrets["auth"]["password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # First run, show input for password.
+        st.text_input(
+            "Please enter the Teapress access code:", type="password", on_change=password_entered, key="password"
+        )
+        return False
+    elif not st.session_state["password_correct"]:
+        # Password incorrect, show input + error.
+        st.text_input(
+            "Please enter the Teapress access code:", type="password", on_change=password_entered, key="password"
+        )
+        st.error("😕 Access code incorrect")
+        return False
+    else:
+        # Password correct.
+        return True
+
+if not check_password():
+    st.stop()
+
 # --- APP UI ---
 
 st.set_page_config(page_title="Teapress Recruiting", layout="wide", initial_sidebar_state="expanded")
@@ -239,7 +271,24 @@ try:
     openai_client = get_openai_client()
     sparse_model = get_sparse_embedding_model()
 except Exception as e:
-    st.error(f"Initialization Error: {e}")
+    st.error(f"⚠️ Configuration Error: {e}")
+    st.markdown("""
+    ### How to fix this on Streamlit Cloud:
+    1. Go to your app dashboard at **share.streamlit.io**.
+    2. Click the **three dots (⋮)** next to your app -> **Settings**.
+    3. Go to the **Secrets** tab.
+    4. Paste your configuration (from your local `.streamlit/secrets.toml`) into the box:
+    
+    ```toml
+    [qdrant]
+    url = "YOUR_QDRANT_URL"
+    api_key = "YOUR_QDRANT_KEY"
+
+    [openai]
+    api_key = "YOUR_OPENAI_KEY"
+    ```
+    5. Click **Save**. The app will restart automatically.
+    """)
     st.stop()
 
 # --- SIDEBAR: BULK UPLOAD ---

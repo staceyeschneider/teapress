@@ -9,6 +9,9 @@ import docx
 import uuid
 import io
 
+# --- APP UI CONFIG ---
+st.set_page_config(page_title="Teapress Recruiting", layout="wide", initial_sidebar_state="expanded")
+
 # --- UTILS SECTION (Merged to avoid import errors) ---
 
 # Constants
@@ -151,24 +154,34 @@ def extract_metadata(text, client):
         return {}
 
 def generate_search_reasoning(query, candidate_data, client):
-    if not client: return "AI Reasoning unavailable."
+    """Generates a reason why the candidate matches the query."""
+    if not client:
+        return "AI Reasoning unavailable."
+    
     try:
-        resume_snippet = candidate_data.get('text', '')[:1000]
+        # Construct a mini-prompt
+        resume_snippet = candidate_data.get('text', '')[:1000] # First 1000 chars
         prompt = f"""
         Query: "{query}"
         Candidate: {candidate_data.get('candidate_name')}
         Skills: {candidate_data.get('skills')}
         Resume Snippet: {resume_snippet}...
         
-        Explain in 1 short sentence why this candidate is a good match for the query. Highlight key matching skills or experience.
+        Analyze this candidate against the query.
+        Provide 2 bullet points on why they are a good fit.
+        Provide 1 bullet point on a potential concern or missing skill (if any).
+        Format as HTML: 
+        <b>✅ Why they fit:</b><br>- Point 1<br>- Point 2<br><br>
+        <b>⚠️ Potential Concerns:</b><br>- Concern 1
         """
+        
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a recruiter assistant. Be concise and professional."},
+                {"role": "system", "content": "You are a critical recruiter assistant. Be concise."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=60
+            max_tokens=150
         )
         return response.choices[0].message.content
     except Exception:
@@ -186,29 +199,39 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
-    if "password_correct" not in st.session_state:
-        # First run, show input for password.
-        st.text_input(
-            "Please enter the Teapress access code:", type="password", on_change=password_entered, key="password"
-        )
-        return False
-    elif not st.session_state["password_correct"]:
-        # Password incorrect, show input + error.
-        st.text_input(
-            "Please enter the Teapress access code:", type="password", on_change=password_entered, key="password"
-        )
-        st.error("😕 Access code incorrect")
-        return False
-    else:
-        # Password correct.
+    if st.session_state.get("password_correct", False):
         return True
+
+    # Show Login Page
+    st.markdown("""
+    <style>
+        .stTextInput > div > div > input {
+            text-align: center;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown("<h1 style='text-align: center; color: #002147;'>🍵 Teapress Recruiting</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>Welcome back, Joanna! Please enter your secret tea code to brew up some candidates.</p>", unsafe_allow_html=True)
+        st.text_input(
+            "Access Code", 
+            type="password", 
+            on_change=password_entered, 
+            key="password", 
+            label_visibility="collapsed",
+            placeholder="Enter Access Code"
+        )
+        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+            st.error("😕 That code didn't steep correctly. Try again?")
+            
+    return False
 
 if not check_password():
     st.stop()
 
 # --- APP UI ---
-
-st.set_page_config(page_title="Teapress Recruiting", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -388,33 +411,57 @@ if uploaded_files:
 st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    search_query = st.text_input("Who are you looking for today?", placeholder="e.g. Friendly Customer Success Manager who loves tea and has startup experience")
-with col2:
-    st.write("") # Spacer
-    st.write("")
-    search_btn = st.button("Find Matches", type="primary", use_container_width=True)
+# --- MAIN AREA: RECRUITER SEARCH ---
+st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
-if search_btn and search_query:
+st.markdown("### 🔎 How do you want to search?")
+search_tab1, search_tab2 = st.tabs(["Quick Search", "Match with Job Description"])
+
+with search_tab1:
+    search_query = st.text_input("Describe the perfect candidate:", placeholder="e.g. Friendly Customer Success Manager who loves tea and has startup experience")
+    search_btn_1 = st.button("Find Matches", type="primary", key="btn1")
+
+with search_tab2:
+    col_jd1, col_jd2 = st.columns([1, 1])
+    with col_jd1:
+        job_description = st.text_area("Paste the Job Description here:", height=250, placeholder="Paste the full JD text here...")
+    with col_jd2:
+        st.info("💡 **Pro Tip:** Pasting the full JD helps our AI find candidates with the exact skills and experience required for the role.")
+        st.write("")
+        search_btn_2 = st.button("Find Matches based on JD", type="primary", key="btn2")
+
+# Determine active search
+active_query = ""
+if search_btn_1 and search_query:
+    active_query = search_query
+elif search_btn_2 and job_description:
+    active_query = f"Job Description:\n{job_description}"
+
+if active_query:
     if not openai_client:
         st.error("OpenAI API Key is missing.")
     else:
         with st.spinner("Searching candidates..."):
             try:
-                results = hybrid_search(search_query, qdrant_client, openai_client, sparse_model, limit=10)
+                results = hybrid_search(active_query, qdrant_client, openai_client, sparse_model, limit=10)
                 
                 if not results:
-                    st.warning("No perfect matches found yet. Try a broader search?")
+                    st.warning("No matches found. Try a broader search.")
                 else:
-                    st.success(f"Found {len(results)} great candidates for Teapress.")
+                    # Check quality of results
+                    top_score = results[0].score
+                    if top_score < 0.7:
+                        st.warning(f"Found {len(results)} candidates, but the match scores are low (Top: {int(top_score*100)}%). You might need to adjust your search.")
+                    else:
+                        st.success(f"Found {len(results)} strong candidates for Teapress.")
                     
                     for point in results:
                         payload = point.payload
                         score = point.score
                         
-                        # Generate AI Reasoning on the fly
-                        reasoning = generate_search_reasoning(search_query, payload, openai_client)
+                        # Generate AI Reasoning (Pros & Cons)
+                        reasoning = generate_search_reasoning(active_query, payload, openai_client)
                         
                         # Render Card
                         st.markdown(f"""
@@ -424,7 +471,7 @@ if search_btn and search_query:
                             <p style="color: #666;"><strong>Location: {payload.get('location', 'Unknown')}</strong> &nbsp;|&nbsp; <strong>Experience: {payload.get('years_experience', 0)} Years</strong></p>
                             <p><strong>Key Skills:</strong> {', '.join(payload.get('skills', [])[:8])}...</p>
                             <div class="reasoning-box">
-                                <strong>Why they fit Teapress:</strong> {reasoning}
+                                {reasoning}
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
@@ -446,7 +493,7 @@ if search_btn and search_query:
                                             
                                             Context:
                                             - We are Teapress, a modern tea company.
-                                            - We are looking for: {search_query}
+                                            - We are looking for: {active_query}
                                             - Why we like them: {reasoning}
                                             
                                             Keep it short, friendly, and mention specifically why their background stands out based on the query.

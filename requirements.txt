@@ -1,0 +1,11 @@
+streamlit
+qdrant-client
+openai
+fastembed
+pypdf
+python-dotenv
+tqdm
+tenacity
+python-docx
+
+

@@ -183,7 +183,10 @@ def generate_search_reasoning(query, candidate_data, client):
             ],
             max_tokens=150
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        # Clean up markdown formatting if present
+        content = content.replace("```html", "").replace("```", "").strip()
+        return content
     except Exception:
         return "Could not generate reasoning."
 
@@ -411,9 +414,7 @@ if uploaded_files:
 st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
-# --- MAIN AREA: RECRUITER SEARCH ---
-st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
+
 
 st.markdown("### 🔎 How do you want to search?")
 search_tab1, search_tab2 = st.tabs(["Quick Search", "Match with Job Description"])

@@ -8,13 +8,12 @@ from pypdf import PdfReader
 import docx
 import uuid
 import io
+import datetime
 
 # --- APP UI CONFIG ---
 st.set_page_config(page_title="Teapress Recruiting", layout="wide", initial_sidebar_state="expanded")
 
-# --- UTILS SECTION (Merged to avoid import errors) ---
-
-# Constants
+# --- CONSTANTS ---
 COLLECTION_NAME = "resumes"
 JOBS_COLLECTION_NAME = "jobs"
 DENSE_VECTOR_NAME = "resume_embedding"
@@ -22,31 +21,166 @@ SPARSE_VECTOR_NAME = "resume_keywords"
 DENSE_MODEL_NAME = "text-embedding-3-small"
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 
-# ... (Previous imports and client getters remain the same) ...
+# --- CLIENT INITIALIZATION ---
+@st.cache_resource
+def get_qdrant_client():
+    if "qdrant" in st.secrets:
+        url = st.secrets["qdrant"]["url"]
+        api_key = st.secrets["qdrant"]["api_key"]
+    else:
+        url = os.getenv("QDRANT_URL")
+        api_key = os.getenv("QDRANT_API_KEY")
+    
+    if not url:
+        raise ValueError("Qdrant URL not found.")
+    return QdrantClient(url=url, api_key=api_key)
 
-# --- JOB MANAGEMENT FUNCTIONS ---
-def ensure_collections_exist(qdrant_client):
-    """Ensures both resumes and jobs collections exist."""
+@st.cache_resource
+def get_openai_client():
+    if "openai" in st.secrets:
+        api_key = st.secrets["openai"]["api_key"]
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key: return None
+    return OpenAI(api_key=api_key)
+
+@st.cache_resource
+def get_sparse_embedding_model():
+    return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
+
+# --- PARSING FUNCTIONS ---
+def parse_pdf(file):
+    pdf_reader = PdfReader(file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
+def parse_docx(file):
+    doc = docx.Document(file)
+    text = []
+    for para in doc.paragraphs:
+        text.append(para.text)
+    return "\n".join(text)
+
+def parse_text_file(file):
     try:
-        # Resumes Collection
+        return file.read().decode("utf-8")
+    except UnicodeDecodeError:
+        file.seek(0)
+        return file.read().decode("latin-1")
+
+def get_resume_text(file, filename):
+    filename_lower = filename.lower()
+    if filename_lower.endswith('.pdf'): return parse_pdf(file)
+    elif filename_lower.endswith('.docx'): return parse_docx(file)
+    elif filename_lower.endswith('.txt') or filename_lower.endswith('.md'): return parse_text_file(file)
+    elif filename_lower.endswith('.doc'): raise ValueError("Legacy .doc format not supported. Please convert to .docx")
+    else: raise ValueError("Unsupported file format")
+
+# --- EMBEDDING & INDEXING ---
+def generate_dense_embedding(text, client):
+    if not client: raise ValueError("OpenAI Client not initialized.")
+    truncated_text = text[:32000]
+    response = client.embeddings.create(input=truncated_text, model=DENSE_MODEL_NAME)
+    return response.data[0].embedding
+
+def generate_sparse_embedding(text, model):
+    embeddings = list(model.embed([text]))
+    if not embeddings: return None
+    sparse_vec = embeddings[0]
+    return models.SparseVector(indices=sparse_vec.indices.tolist(), values=sparse_vec.values.tolist())
+
+def index_resume(text, metadata, qdrant_client, openai_client, sparse_model):
+    dense_vec = generate_dense_embedding(text, openai_client)
+    sparse_vec = generate_sparse_embedding(text, sparse_model)
+    point_id = str(uuid.uuid4())
+    point = models.PointStruct(
+        id=point_id,
+        vector={DENSE_VECTOR_NAME: dense_vec, SPARSE_VECTOR_NAME: sparse_vec},
+        payload={"text": text, **metadata}
+    )
+    qdrant_client.upsert(collection_name=COLLECTION_NAME, points=[point])
+    return point_id
+
+# --- SEARCH & AI ---
+def hybrid_search(query_text, qdrant_client, openai_client, sparse_model, limit=20):
+    dense_vec = generate_dense_embedding(query_text, openai_client)
+    sparse_vec = generate_sparse_embedding(query_text, sparse_model)
+    
+    prefetch_dense = models.Prefetch(query=dense_vec, using=DENSE_VECTOR_NAME, limit=limit * 2)
+    prefetch_sparse = models.Prefetch(query=sparse_vec, using=SPARSE_VECTOR_NAME, limit=limit * 2)
+    
+    results = qdrant_client.query_points(
+        collection_name=COLLECTION_NAME,
+        prefetch=[prefetch_dense, prefetch_sparse],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        limit=limit,
+        with_payload=True
+    )
+    return results.points
+
+def extract_metadata(text, client):
+    if not client: return {}
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that extracts structured data from resumes. Return a JSON object with keys: 'candidate_name' (string), 'skills' (list of strings), 'years_experience' (integer, total years), and 'location' (string, city/state)."},
+                {"role": "user", "content": f"Extract metadata from this resume:\n\n{text[:4000]}"}
+            ],
+            response_format={"type": "json_object"}
+        )
+        import json
+        content = response.choices[0].message.content
+        return json.loads(content)
+    except Exception as e:
+        print(f"Error extracting metadata: {e}")
+        return {}
+
+def generate_search_reasoning(query, candidate_data, client):
+    if not client: return "AI Reasoning unavailable."
+    try:
+        resume_snippet = candidate_data.get('text', '')[:1000]
+        prompt = f"""
+        Query: "{query}"
+        Candidate: {candidate_data.get('candidate_name')}
+        Skills: {candidate_data.get('skills')}
+        Resume Snippet: {resume_snippet}...
+        
+        Analyze this candidate against the query.
+        Provide 2 bullet points on why they are a good fit.
+        Provide 1 bullet point on a potential concern or missing skill (if any).
+        Format as HTML: 
+        <b>✅ Why they fit:</b><br>- Point 1<br>- Point 2<br><br>
+        <b>⚠️ Potential Concerns:</b><br>- Concern 1
+        """
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a critical recruiter assistant. Be concise."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150
+        )
+        content = response.choices[0].message.content
+        return content.replace("```html", "").replace("```", "").strip()
+    except Exception:
+        return "Could not generate reasoning."
+
+# --- JOB MANAGEMENT ---
+def ensure_collections_exist(qdrant_client):
+    try:
         if not qdrant_client.collection_exists(collection_name=COLLECTION_NAME):
             qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config={
-                    DENSE_VECTOR_NAME: models.VectorParams(size=1536, distance=models.Distance.COSINE)
-                },
-                sparse_vectors_config={
-                    SPARSE_VECTOR_NAME: models.SparseVectorParams()
-                }
+                vectors_config={DENSE_VECTOR_NAME: models.VectorParams(size=1536, distance=models.Distance.COSINE)},
+                sparse_vectors_config={SPARSE_VECTOR_NAME: models.SparseVectorParams()}
             )
-        
-        # Jobs Collection
         if not qdrant_client.collection_exists(collection_name=JOBS_COLLECTION_NAME):
             qdrant_client.create_collection(
                 collection_name=JOBS_COLLECTION_NAME,
-                vectors_config={
-                    "job_embedding": models.VectorParams(size=1536, distance=models.Distance.COSINE)
-                }
+                vectors_config={"job_embedding": models.VectorParams(size=1536, distance=models.Distance.COSINE)}
             )
         return True
     except Exception as e:
@@ -54,20 +188,13 @@ def ensure_collections_exist(qdrant_client):
         return False
 
 def create_job(title, description, qdrant_client, openai_client):
-    """Creates a new job requisition."""
     try:
-        # Embed the description for future matching
         embedding = generate_dense_embedding(description, openai_client)
-        
         point_id = str(uuid.uuid4())
         point = models.PointStruct(
             id=point_id,
             vector={"job_embedding": embedding},
-            payload={
-                "title": title,
-                "description": description,
-                "created_at": str(uuid.uuid1()) # Simple timestamp
-            }
+            payload={"title": title, "description": description, "created_at": str(uuid.uuid1())}
         )
         qdrant_client.upsert(collection_name=JOBS_COLLECTION_NAME, points=[point])
         return True
@@ -76,38 +203,82 @@ def create_job(title, description, qdrant_client, openai_client):
         return False
 
 def get_all_jobs(qdrant_client):
-    """Fetches all jobs."""
     try:
-        # Scroll to get all (limit 100 for now)
-        result, _ = qdrant_client.scroll(
-            collection_name=JOBS_COLLECTION_NAME,
-            limit=100,
-            with_payload=True,
-            with_vectors=False
-        )
+        result, _ = qdrant_client.scroll(collection_name=JOBS_COLLECTION_NAME, limit=100, with_payload=True, with_vectors=False)
         return result
     except Exception:
         return []
 
+def update_candidate_metadata(point_id, update_dict):
+    try:
+        qdrant_client.set_payload(collection_name=COLLECTION_NAME, payload=update_dict, points=[point_id])
+        return True
+    except Exception as e:
+        st.error(f"Error updating candidate: {e}")
+        return False
+
+def add_note(point_id, current_notes, new_note):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    note_entry = f"[{timestamp}] {new_note}"
+    updated_notes = current_notes + [note_entry]
+    success = update_candidate_metadata(point_id, {"notes": updated_notes})
+    return success, updated_notes
+
 def shortlist_candidate(candidate_id, job_id, job_title, current_shortlists):
-    """Adds a job to the candidate's shortlist."""
-    # current_shortlists is a list of dicts: [{"job_id": "...", "job_title": "..."}]
     new_entry = {"job_id": job_id, "job_title": job_title}
-    
-    # Check for duplicates
-    if any(entry['job_id'] == job_id for entry in current_shortlists):
-        return False # Already shortlisted
-        
+    if any(entry['job_id'] == job_id for entry in current_shortlists): return False
     updated_list = current_shortlists + [new_entry]
     return update_candidate_metadata(candidate_id, {"shortlists": updated_list})
 
-# ... (Previous parsing/embedding functions remain the same) ...
+# --- AUTHENTICATION ---
+def check_password():
+    def password_entered():
+        if st.session_state["password"] == st.secrets["auth"]["password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
 
-# --- SIDEBAR: JOBS & UPLOAD ---
+    if st.session_state.get("password_correct", False): return True
+
+    st.markdown("""<style>.stTextInput > div > div > input {text-align: center;}</style>""", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown("<h1 style='text-align: center; color: #002147;'>🍵 Teapress Recruiting</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>Welcome back, Joanna! Please enter your secret tea code to brew up some candidates.</p>", unsafe_allow_html=True)
+        st.text_input("Access Code", type="password", on_change=password_entered, key="password", label_visibility="collapsed", placeholder="Enter Access Code")
+        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+            st.error("😕 That code didn't steep correctly. Try again?")
+    return False
+
+if not check_password(): st.stop()
+
+# --- APP UI ---
+st.markdown("""
+<style>
+    .reportview-container { background: #FAFAF9; }
+    .main-header { font-family: 'Helvetica Neue', sans-serif; font-size: 3rem; color: #002147; font-weight: 700; margin-bottom: 0px; }
+    .sub-header { font-size: 1.2rem; color: #57534E; margin-bottom: 30px; }
+    .card { background-color: white; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; border-left: 6px solid #002147; transition: transform 0.2s; }
+    .card:hover { transform: translateY(-2px); }
+    .score-badge { background-color: #E0E7FF; color: #002147; padding: 6px 12px; border-radius: 20px; font-weight: bold; float: right; font-size: 0.9rem; }
+    .reasoning-box { background-color: #F8FAFC; padding: 15px; border-radius: 8px; margin-top: 15px; font-style: italic; color: #334155; border: 1px solid #E2E8F0; }
+    .stButton>button { background-color: #002147 !important; color: white !important; border-radius: 8px !important; border: none !important; padding: 10px 20px !important; }
+</style>
+""", unsafe_allow_html=True)
+
+try:
+    qdrant_client = get_qdrant_client()
+    openai_client = get_openai_client()
+    sparse_model = get_sparse_embedding_model()
+except Exception as e:
+    st.error(f"⚠️ Configuration Error: {e}")
+    st.stop()
+
+# --- SIDEBAR ---
 st.sidebar.title("Teapress Recruiting")
-
-# 1. Job Management
 st.sidebar.header("📂 Job Requisitions")
+
 jobs = get_all_jobs(qdrant_client)
 job_options = {job.payload['title']: job for job in jobs}
 job_titles = ["-- None --"] + list(job_options.keys())
@@ -134,47 +305,29 @@ with st.sidebar.expander("➕ Create New Job"):
             st.sidebar.error("Please fill in both fields.")
 
 st.sidebar.divider()
-
-# 2. Bulk Upload (Existing Logic)
 st.sidebar.header("📥 Upload Resumes")
-# ... (Existing upload logic) ...
-uploaded_files = st.sidebar.file_uploader(
-    "Upload Resumes (PDF, DOCX, TXT)", 
-    type=["pdf", "docx", "txt", "md"], 
-    accept_multiple_files=True
-)
+st.sidebar.info("Hi Joanna! Drag & drop resumes here to add them to your Teapress talent pool.")
+uploaded_files = st.sidebar.file_uploader("Upload Resumes (PDF, DOCX, TXT)", type=["pdf", "docx", "txt", "md"], accept_multiple_files=True)
 
 if uploaded_files:
     if st.sidebar.button(f"Process {len(uploaded_files)} Resumes"):
-        # ... (Existing processing logic, ensure ensure_collections_exist is called first) ...
         ensure_collections_exist(qdrant_client)
-        # ... (Rest of processing loop) ...
-        if not openai_client:
-            st.sidebar.error("OpenAI API Key is missing.")
+        if not openai_client: st.sidebar.error("OpenAI API Key is missing.")
         else:
             progress_bar = st.sidebar.progress(0)
             status_text = st.sidebar.empty()
             success_count = 0
             errors = []
-            
             for i, uploaded_file in enumerate(uploaded_files):
                 status_text.text(f"Reading {uploaded_file.name}...")
-                
-                # Explicitly check for legacy .doc files
                 if uploaded_file.name.lower().endswith('.doc'):
                     errors.append(f"{uploaded_file.name}: Legacy .doc format. Please save as .docx")
                     progress_bar.progress((i + 1) / len(uploaded_files))
                     continue
-
                 try:
-                    # 1. Extract Text
                     text = get_resume_text(uploaded_file, uploaded_file.name)
-                    
                     if text:
-                        # 2. AI Extraction
                         ai_metadata = extract_metadata(text, openai_client)
-                        
-                        # 3. Prepare Metadata
                         c_name = ai_metadata.get("candidate_name") or uploaded_file.name.rsplit('.', 1)[0].replace("_", " ").replace("-", " ").title()
                         metadata = {
                             "candidate_name": c_name,
@@ -182,36 +335,24 @@ if uploaded_files:
                             "years_experience": ai_metadata.get("years_experience", 0),
                             "location": ai_metadata.get("location", "Unknown"),
                             "source_filename": uploaded_file.name,
-                            "shortlists": [] # Initialize empty shortlist
+                            "shortlists": []
                         }
-                        
-                        # 4. Index
                         index_resume(text, metadata, qdrant_client, openai_client, sparse_model)
                         success_count += 1
-                    else:
-                        errors.append(f"{uploaded_file.name}: Could not read file content")
-                except Exception as e:
-                    errors.append(f"{uploaded_file.name}: {str(e)}")
-                
+                    else: errors.append(f"{uploaded_file.name}: Could not read file content")
+                except Exception as e: errors.append(f"{uploaded_file.name}: {str(e)}")
                 progress_bar.progress((i + 1) / len(uploaded_files))
-            
             status_text.text("Processing Complete")
-            if success_count > 0:
-                st.sidebar.success(f"Added {success_count} new candidates.")
-            
+            if success_count > 0: st.sidebar.success(f"Added {success_count} new candidates.")
             if errors:
                 st.sidebar.error(f"Had trouble with {len(errors)} files.")
                 with st.sidebar.expander("See details"):
-                    for err in errors:
-                        st.write(f"- {err}")
-
+                    for err in errors: st.write(f"- {err}")
 
 # --- MAIN AREA ---
-# ... (Header) ...
 st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
-# Show Active Job Context
 if st.session_state.active_job_title:
     st.info(f"📂 **Active Job:** {st.session_state.active_job_title}")
 
@@ -223,7 +364,6 @@ with search_tab1:
     search_btn_1 = st.button("Find Matches", type="primary", key="btn1")
 
 with search_tab2:
-    # Auto-fill if active job
     default_jd = active_job_data.payload['description'] if active_job_data else ""
     col_jd1, col_jd2 = st.columns([1, 1])
     with col_jd1:
@@ -233,56 +373,135 @@ with search_tab2:
         st.write("")
         search_btn_2 = st.button("Find Matches based on JD", type="primary", key="btn2")
 
+# --- SEARCH STATE ---
+if "search_results" not in st.session_state: st.session_state.search_results = []
+if "last_query" not in st.session_state: st.session_state.last_query = ""
+
+active_query = ""
+if search_btn_1 and search_query: active_query = search_query
+elif search_btn_2 and job_description: active_query = f"Job Description:\n{job_description}"
+
+if active_query:
+    st.session_state.last_query = active_query
+    if not openai_client: st.error("OpenAI API Key is missing.")
+    else:
+        with st.spinner("Searching candidates..."):
+            try:
+                results = hybrid_search(active_query, qdrant_client, openai_client, sparse_model, limit=20)
+                st.session_state.search_results = results
+            except Exception as e: st.error(f"Search Error: {e}")
+
 with search_tab3:
     if st.session_state.active_job_id:
         if st.button("Refresh Shortlist"):
-            # We need to filter candidates who have this job_id in their 'shortlists'
-            # Qdrant filtering
-            shortlist_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="shortlists.job_id",
-                        match=models.MatchValue(value=st.session_state.active_job_id)
-                    )
-                ]
-            )
-            # Fetch them
-            shortlisted_points, _ = qdrant_client.scroll(
-                collection_name=COLLECTION_NAME,
-                scroll_filter=shortlist_filter,
-                limit=100,
-                with_payload=True
-            )
+            shortlist_filter = models.Filter(must=[models.FieldCondition(key="shortlists.job_id", match=models.MatchValue(value=st.session_state.active_job_id))])
+            shortlisted_points, _ = qdrant_client.scroll(collection_name=COLLECTION_NAME, scroll_filter=shortlist_filter, limit=100, with_payload=True)
             st.session_state.search_results = shortlisted_points
             st.session_state.last_query = f"Shortlist for {st.session_state.active_job_title}"
             st.rerun()
         st.write("Click Refresh to see candidates saved to this job.")
-    else:
-        st.warning("Please select an Active Job from the sidebar to view its shortlist.")
+    else: st.warning("Please select an Active Job from the sidebar to view its shortlist.")
 
-# ... (Search Logic & Result Rendering) ...
-# ... (Inside Result Loop) ...
+# --- RENDER RESULTS ---
+if st.session_state.search_results:
+    results = st.session_state.search_results
+    col_filter1, col_filter2 = st.columns([3, 1])
+    with col_filter2: show_ignored = st.checkbox("Show Ignored Candidates", value=False)
+    
+    visible_results = []
+    for point in results:
+        status = point.payload.get("status", "New")
+        if status == "Ignored" and not show_ignored: continue
+        visible_results.append(point)
+
+    if not visible_results: st.warning("No active candidates found (check 'Show Ignored' if you archived them).")
+    else:
+        top_score = visible_results[0].score if visible_results else 0
+        if top_score < 0.7 and "Shortlist" not in st.session_state.last_query:
+            st.warning(f"Found candidates, but match scores are low (Top: {int(top_score*100)}%). Consider refining your search.")
+        else:
+            st.success(f"Showing {len(visible_results)} candidates for: '{st.session_state.last_query[:50]}...'")
+
+        for point in visible_results:
+            payload = point.payload
+            score = point.score
+            status = payload.get("status", "New")
+            rating = payload.get("rating", 0)
+            notes = payload.get("notes", [])
+            reasoning = generate_search_reasoning(st.session_state.last_query, payload, openai_client)
             
-            # --- ACTIONS & ANNOTATIONS ---
+            card_style = "border-left: 6px solid #002147;"
+            if status == "Ignored": card_style = "border-left: 6px solid #94a3b8; opacity: 0.7;"
+            elif status == "Contacted": card_style = "border-left: 6px solid #10b981;"
+            
+            st.markdown(f"""
+            <div class="card" style="{card_style}">
+                <span class="score-badge">Match: {int(score * 100)}%</span>
+                <h3 style="color: #002147; margin-top:0;">{payload.get('candidate_name', 'Unknown Candidate')}</h3>
+                <p style="color: #666;"><strong>Location: {payload.get('location', 'Unknown')}</strong> &nbsp;|&nbsp; <strong>Experience: {payload.get('years_experience', 0)} Years</strong></p>
+                <p><strong>Key Skills:</strong> {', '.join(payload.get('skills', [])[:8])}...</p>
+                <div class="reasoning-box">{reasoning}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
             with st.expander("📝 Review & Annotate", expanded=False):
                 col_review1, col_review2 = st.columns([1, 1])
-                
                 with col_review1:
-                    # Shortlist Button (If Job Active)
                     if st.session_state.active_job_id:
                         current_shortlists = payload.get("shortlists", [])
                         is_shortlisted = any(entry['job_id'] == st.session_state.active_job_id for entry in current_shortlists)
-                        
-                        if is_shortlisted:
-                            st.success(f"✅ Shortlisted for {st.session_state.active_job_title}")
+                        if is_shortlisted: st.success(f"✅ Shortlisted for {st.session_state.active_job_title}")
                         else:
                             if st.button(f"⭐ Add to {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
                                 shortlist_candidate(point.id, st.session_state.active_job_id, st.session_state.active_job_title, current_shortlists)
                                 st.rerun()
-                    else:
-                        st.caption("Select a Job in the sidebar to shortlist candidates.")
+                    else: st.caption("Select a Job in the sidebar to shortlist candidates.")
 
-                    # Status Toggle (Existing)
-                    # ...
+                    new_status = st.selectbox("Status", ["New", "Reviewed", "Contacted", "Ignored"], index=["New", "Reviewed", "Contacted", "Ignored"].index(status), key=f"status_{point.id}")
+                    if new_status != status:
+                        update_candidate_metadata(point.id, {"status": new_status})
+                        point.payload["status"] = new_status
+                        st.rerun()
+                    
+                    new_rating = st.slider("Rating", 1, 5, int(rating) if rating else 0, key=f"rating_{point.id}")
+                    if new_rating != rating:
+                        update_candidate_metadata(point.id, {"rating": new_rating})
+                        point.payload["rating"] = new_rating
+                        st.rerun()
 
-```
+                with col_review2:
+                    if notes:
+                        st.markdown("**Previous Notes:**")
+                        for note in notes: st.caption(note)
+                    new_note_text = st.text_input("Add a note:", key=f"note_input_{point.id}")
+                    if st.button("Save Note", key=f"save_note_{point.id}"):
+                        if new_note_text:
+                            success, updated_notes = add_note(point.id, notes, new_note_text)
+                            if success:
+                                point.payload["notes"] = updated_notes
+                                st.success("Note saved!")
+                                st.rerun()
+
+            col_actions1, col_actions2 = st.columns([1, 1])
+            with col_actions1:
+                with st.expander(f"Read Resume"):
+                    st.markdown("### Full Resume Content")
+                    st.text_area("Resume Content", payload.get('text', ''), height=400, label_visibility="collapsed")
+            with col_actions2:
+                with st.expander(f"Draft Email"):
+                    if st.button(f"Generate Email for {payload.get('candidate_name').split()[0]}", key=f"email_{point.id}"):
+                        with st.spinner("Drafting email..."):
+                            try:
+                                email_prompt = f"""
+                                Write a warm, professional recruiting email from Joanna at Teapress to {payload.get('candidate_name')}.
+                                Context:
+                                - We are Teapress, a modern tea company.
+                                - We are looking for: {st.session_state.last_query}
+                                - Why we like them: {reasoning}
+                                Keep it short, friendly, and mention specifically why their background stands out based on the query.
+                                """
+                                email_response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": email_prompt}])
+                                email_draft = email_response.choices[0].message.content
+                                st.text_area("Draft", email_draft, height=250)
+                                st.markdown(f"[Open in Mail App](mailto:?subject=Interview%20with%20Teapress&body={email_draft.replace(' ', '%20').replace(chr(10), '%0A')})")
+                            except Exception as e: st.error("Could not generate email.")

@@ -302,7 +302,11 @@ except Exception as e:
     st.stop()
 
 # --- SIDEBAR ---
-st.sidebar.title("Teapress Recruiting")
+with st.sidebar:
+    try:
+        st.image("assets/teapress_logo.png", use_container_width=True)
+    except:
+        st.title("Teapress Recruiting")
 
 # Job Management Section
 st.sidebar.subheader("Job Requisitions")
@@ -310,7 +314,7 @@ st.sidebar.subheader("Job Requisitions")
 jobs = get_all_jobs(qdrant_client)
 job_options = {job.payload['title']: job for job in jobs}
 # Options: Create New Job + existing jobs
-job_dropdown_options = ["➕ Create New Job"] + sorted(list(job_options.keys()))
+job_dropdown_options = ["Create New Job"] + sorted(list(job_options.keys()))
 
 # Ensure session state selector is valid
 if "job_selector" not in st.session_state:
@@ -329,7 +333,7 @@ selected_option = st.sidebar.selectbox(
 active_job_data = None
 
 # Render UI based on selection
-if selected_option == "➕ Create New Job":
+if selected_option == "Create New Job":
     st.session_state.active_job_id = None
     st.session_state.active_job_title = None
     
@@ -372,7 +376,7 @@ else:
         with col_del:
             if st.button("Delete Job"):
                 delete_job(active_job_data.id, qdrant_client)
-                st.session_state.job_selector = "➕ Create New Job"
+                st.session_state.job_selector = "Create New Job"
                 st.success("Deleted!")
                 st.rerun()
 
@@ -427,12 +431,12 @@ st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next
 if st.session_state.active_job_title:
     st.markdown(f"""
     <div style="background-color: #E0E7FF; padding: 15px; border-radius: 8px; border-left: 5px solid #002147; margin-bottom: 20px;">
-        <h3 style="margin:0; color: #002147;">📂 Working on: {st.session_state.active_job_title}</h3>
+        <h3 style="margin:0; color: #002147;">Working on: {st.session_state.active_job_title}</h3>
         <p style="margin:0; color: #4B5563; font-size: 0.9rem;">Search results and shortlists will be linked to this job.</p>
     </div>
     """, unsafe_allow_html=True)
 else:
-    st.info("👈 Please select a **Job Requisition** from the sidebar to start searching.")
+    st.info("Please select a **Job Requisition** from the sidebar to start searching.")
 
 st.markdown("### Search Candidates")
 search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "View Shortlist"])
@@ -506,89 +510,106 @@ if st.session_state.search_results:
             status = payload.get("status", "New")
             rating = payload.get("rating", 0)
             notes = payload.get("notes", [])
-            reasoning = generate_search_reasoning(st.session_state.last_query, payload, openai_client)
             
-            card_style = "border-left: 6px solid #002147;"
-            if status == "Ignored": card_style = "border-left: 6px solid #94a3b8; opacity: 0.7;"
-            elif status == "Contacted": card_style = "border-left: 6px solid #10b981;"
-            
-            st.markdown(f"""
-            <div class="card" style="{card_style}">
-                <span class="score-badge">Match: {int(score * 100)}%</span>
-                <h3 style="color: #002147; margin-top:0;">{payload.get('candidate_name', 'Unknown Candidate')}</h3>
-                <p style="color: #666;"><strong>Location: {payload.get('location', 'Unknown')}</strong> &nbsp;|&nbsp; <strong>Experience: {payload.get('years_experience', 0)} Years</strong></p>
-                <p><strong>Key Skills:</strong> {', '.join(payload.get('skills', [])[:8])}...</p>
-                <div class="reasoning-box">{reasoning}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            with st.expander("Review & Annotate", expanded=False):
-                col_review1, col_review2 = st.columns([1, 1])
-                with col_review1:
-                    # Shortlist Logic
-                    if st.session_state.active_job_id:
-                        current_shortlists = payload.get("shortlists", [])
-                        is_shortlisted = any(entry['job_id'] == st.session_state.active_job_id for entry in current_shortlists)
+            # --- CARD CONTAINER ---
+            with st.container(border=True):
+                # Header Row
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"<h3 style='margin:0; color:#002147;'>{payload.get('candidate_name', 'Unknown')}</h3>", unsafe_allow_html=True)
+                    st.markdown(f"**{payload.get('location', 'Unknown')}** • {payload.get('years_experience', 0)} Years Exp")
+                with c2:
+                    match_color = "green" if score > 0.8 else "orange" if score > 0.7 else "red"
+                    st.markdown(f"""
+                        <div style="text-align:right;">
+                            <span style="background-color:#E0E7FF; padding:4px 10px; border-radius:12px; font-weight:bold; color:#002147;">
+                                {int(score*100)}% Match
+                            </span>
+                            <div style="margin-top:5px; font-size:0.8rem; color:#666;">Status: {status}</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                # Tabs for content
+                tab_overview, tab_resume, tab_review, tab_email = st.tabs(["Overview", "Resume", "Review & Notes", "Draft Email"])
+                
+                with tab_overview:
+                    st.markdown(f"**Key Skills:** {', '.join(payload.get('skills', [])[:10])}")
+                    reasoning = generate_search_reasoning(st.session_state.last_query, payload, openai_client)
+                    st.markdown(f"""
+                    <div style="background-color:#F8FAFC; padding:15px; border-radius:8px; border:1px solid #E2E8F0; margin-top:10px;">
+                        {reasoning}
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with tab_resume:
+                    st.text_area("Resume Content", payload.get('text', ''), height=400, label_visibility="collapsed", key=f"resume_{point.id}")
+                
+                with tab_review:
+                    r1, r2 = st.columns(2)
+                    with r1:
+                        # Status & Rating
+                        new_status = st.selectbox("Application Status", ["New", "Reviewed", "Contacted", "Ignored"], index=["New", "Reviewed", "Contacted", "Ignored"].index(status), key=f"status_{point.id}")
+                        if new_status != status:
+                            update_candidate_metadata(point.id, {"status": new_status})
+                            point.payload["status"] = new_status
+                            st.rerun()
                         
-                        if is_shortlisted:
-                            st.success(f"✅ Shortlisted for {st.session_state.active_job_title}")
-                            if st.button("Remove from Shortlist", key=f"remove_shortlist_{point.id}"):
-                                # Remove logic
-                                updated_list = [entry for entry in current_shortlists if entry['job_id'] != st.session_state.active_job_id]
-                                update_candidate_metadata(point.id, {"shortlists": updated_list})
-                                st.rerun()
+                        new_rating = st.slider("Star Rating", 1, 5, int(rating) if rating else 0, key=f"rating_{point.id}")
+                        if new_rating != rating:
+                            update_candidate_metadata(point.id, {"rating": new_rating})
+                            point.payload["rating"] = new_rating
+                            st.rerun()
+                            
+                        # Shortlist Logic
+                        if st.session_state.active_job_id:
+                            current_shortlists = payload.get("shortlists", [])
+                            is_shortlisted = any(entry['job_id'] == st.session_state.active_job_id for entry in current_shortlists)
+                            
+                            if is_shortlisted:
+                                st.success(f"Shortlisted for {st.session_state.active_job_title}")
+                                if st.button("Remove from Shortlist", key=f"rem_sl_{point.id}"):
+                                    updated_list = [entry for entry in current_shortlists if entry['job_id'] != st.session_state.active_job_id]
+                                    update_candidate_metadata(point.id, {"shortlists": updated_list})
+                                    st.rerun()
+                            else:
+                                if st.button(f"Add to Shortlist", key=f"add_sl_{point.id}"):
+                                    shortlist_candidate(point.id, st.session_state.active_job_id, st.session_state.active_job_title, current_shortlists)
+                                    st.rerun()
                         else:
-                            if st.button(f"Add to Shortlist: {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
-                                shortlist_candidate(point.id, st.session_state.active_job_id, st.session_state.active_job_title, current_shortlists)
-                                st.rerun()
-                    else:
-                        st.info("Select a Job in the sidebar to add this candidate to a shortlist.")
+                            st.info("Select a Job to enable shortlisting.")
 
-                    new_status = st.selectbox("Status", ["New", "Reviewed", "Contacted", "Ignored"], index=["New", "Reviewed", "Contacted", "Ignored"].index(status), key=f"status_{point.id}")
-                    if new_status != status:
-                        update_candidate_metadata(point.id, {"status": new_status})
-                        point.payload["status"] = new_status
-                        st.rerun()
-                    
-                    new_rating = st.slider("Rating", 1, 5, int(rating) if rating else 0, key=f"rating_{point.id}")
-                    if new_rating != rating:
-                        update_candidate_metadata(point.id, {"rating": new_rating})
-                        point.payload["rating"] = new_rating
-                        st.rerun()
-
-                with col_review2:
-                    if notes:
-                        st.markdown("**Previous Notes:**")
-                        for note in notes: st.caption(note)
-                    new_note_text = st.text_input("Add a note:", key=f"note_input_{point.id}")
-                    if st.button("Save Note", key=f"save_note_{point.id}"):
-                        if new_note_text:
-                            success, updated_notes = add_note(point.id, notes, new_note_text)
-                            if success:
-                                point.payload["notes"] = updated_notes
-                                st.success("Note saved!")
-                                st.rerun()
-
-            col_actions1, col_actions2 = st.columns([1, 1])
-            with col_actions1:
-                with st.expander(f"Read Resume"):
-                    st.markdown("### Full Resume Content")
-                    st.text_area("Resume Content", payload.get('text', ''), height=400, label_visibility="collapsed")
-            with col_actions2:
-                with st.expander(f"Draft Email"):
-                    if st.button(f"Generate Email for {payload.get('candidate_name').split()[0]}", key=f"email_{point.id}"):
-                        with st.spinner("Drafting email..."):
+                    with r2:
+                        # Notes
+                        st.markdown("**Notes History**")
+                        for note in notes:
+                            st.caption(note)
+                        
+                        new_note_text = st.text_input("Add new note", key=f"note_in_{point.id}")
+                        if st.button("Add Note", key=f"btn_note_{point.id}"):
+                            if new_note_text:
+                                success, updated_notes = add_note(point.id, notes, new_note_text)
+                                if success:
+                                    point.payload["notes"] = updated_notes
+                                    st.rerun()
+                
+                with tab_email:
+                    st.write("Generate a personalized outreach email.")
+                    if st.button(f"Draft Email to {payload.get('candidate_name')}", key=f"email_gen_{point.id}"):
+                        with st.spinner("Writing..."):
+                            email_prompt = f"""
+                            Write a warm, professional recruiting email from Joanna at Teapress to {payload.get('candidate_name')}.
+                            Context:
+                            - We are Teapress, a modern tea company.
+                            - We are looking for: {st.session_state.last_query}
+                            - Mention these skills: {', '.join(payload.get('skills', [])[:5])}
+                            Keep it short and friendly.
+                            """
                             try:
-                                email_prompt = f"""
-                                Write a warm, professional recruiting email from Joanna at Teapress to {payload.get('candidate_name')}.
-                                Context:
-                                - We are Teapress, a modern tea company.
-                                - We are looking for: {st.session_state.last_query}
-                                - Why we like them: {reasoning}
-                                Keep it short, friendly, and mention specifically why their background stands out based on the query.
-                                """
                                 email_response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": email_prompt}])
-                                email_draft = email_response.choices[0].message.content
-                                st.text_area("Draft", email_draft, height=250)
-                                st.markdown(f"[Open in Mail App](mailto:?subject=Interview%20with%20Teapress&body={email_draft.replace(' ', '%20').replace(chr(10), '%0A')})")
-                            except Exception as e: st.error("Could not generate email.")
+                                st.session_state[f"email_{point.id}"] = email_response.choices[0].message.content
+                            except Exception as e: st.error("Failed to generate email.")
+                    
+                    if f"email_{point.id}" in st.session_state:
+                         st.text_area("Subject: Invitation to Interview", value=st.session_state[f"email_{point.id}"], height=200)
+                         link_body = st.session_state[f"email_{point.id}"].replace('\n', '%0A')
+                         st.markdown(f"[Open in Mail Client](mailto:?subject=Teapress%20Opportunity&body={link_body})")

@@ -307,6 +307,7 @@ st.sidebar.title("Teapress Recruiting")
 # Job Management Section
 st.sidebar.subheader("Job Requisitions")
 
+# Create Job Logic
 with st.sidebar.expander("Create New Job"):
     new_job_title = st.text_input("Job Title")
     new_job_desc = st.text_area("Job Description")
@@ -314,18 +315,21 @@ with st.sidebar.expander("Create New Job"):
         if new_job_title and new_job_desc:
             if create_job(new_job_title, new_job_desc, qdrant_client, openai_client):
                 st.sidebar.success("Job Created!")
-                st.rerun()
+                st.rerun() # Force reload to show new job in list
         else:
             st.sidebar.error("Please fill in both fields.")
 
+# Job Selection Logic
 jobs = get_all_jobs(qdrant_client)
 job_options = {job.payload['title']: job for job in jobs}
-job_titles = ["-- None --"] + sorted(list(job_options.keys()))
+job_titles = ["-- Select a Job --"] + sorted(list(job_options.keys()))
 
+# Use session state to persist selection across reruns if needed, 
+# but selectbox usually handles this. We'll stick to selectbox for simplicity.
 selected_job_title = st.sidebar.selectbox("Active Job:", job_titles)
 active_job_data = None
 
-if selected_job_title != "-- None --":
+if selected_job_title != "-- Select a Job --":
     active_job_data = job_options[selected_job_title]
     st.session_state.active_job_id = active_job_data.id
     st.session_state.active_job_title = selected_job_title
@@ -397,8 +401,16 @@ if uploaded_files:
 st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
+# ACTIVE JOB BANNER
 if st.session_state.active_job_title:
-    st.info(f"Active Job: **{st.session_state.active_job_title}**")
+    st.markdown(f"""
+    <div style="background-color: #E0E7FF; padding: 15px; border-radius: 8px; border-left: 5px solid #002147; margin-bottom: 20px;">
+        <h3 style="margin:0; color: #002147;">📂 Working on: {st.session_state.active_job_title}</h3>
+        <p style="margin:0; color: #4B5563; font-size: 0.9rem;">Search results and shortlists will be linked to this job.</p>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.info("👈 Please select a **Job Requisition** from the sidebar to start searching.")
 
 st.markdown("### Search Candidates")
 search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "View Shortlist"])
@@ -443,7 +455,7 @@ with search_tab3:
             st.session_state.search_results = shortlisted_points
             st.session_state.last_query = f"Shortlist for {st.session_state.active_job_title}"
             st.rerun()
-        st.write("Click Refresh to see candidates saved to this job.")
+        st.write(f"Candidates shortlisted for **{st.session_state.active_job_title}**:")
     else: st.warning("Please select an Active Job from the sidebar to view its shortlist.")
 
 # --- RENDER RESULTS ---
@@ -491,15 +503,24 @@ if st.session_state.search_results:
             with st.expander("Review & Annotate", expanded=False):
                 col_review1, col_review2 = st.columns([1, 1])
                 with col_review1:
+                    # Shortlist Logic
                     if st.session_state.active_job_id:
                         current_shortlists = payload.get("shortlists", [])
                         is_shortlisted = any(entry['job_id'] == st.session_state.active_job_id for entry in current_shortlists)
-                        if is_shortlisted: st.success(f"Shortlisted for {st.session_state.active_job_title}")
+                        
+                        if is_shortlisted:
+                            st.success(f"✅ Shortlisted for {st.session_state.active_job_title}")
+                            if st.button("Remove from Shortlist", key=f"remove_shortlist_{point.id}"):
+                                # Remove logic
+                                updated_list = [entry for entry in current_shortlists if entry['job_id'] != st.session_state.active_job_id]
+                                update_candidate_metadata(point.id, {"shortlists": updated_list})
+                                st.rerun()
                         else:
-                            if st.button(f"Add to {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
+                            if st.button(f"Add to Shortlist: {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
                                 shortlist_candidate(point.id, st.session_state.active_job_id, st.session_state.active_job_title, current_shortlists)
                                 st.rerun()
-                    else: st.caption("Select a Job in the sidebar to shortlist candidates.")
+                    else:
+                        st.info("Select a Job in the sidebar to add this candidate to a shortlist.")
 
                     new_status = st.selectbox("Status", ["New", "Reviewed", "Contacted", "Ignored"], index=["New", "Reviewed", "Contacted", "Ignored"].index(status), key=f"status_{point.id}")
                     if new_status != status:

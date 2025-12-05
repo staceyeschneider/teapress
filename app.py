@@ -152,8 +152,8 @@ def generate_search_reasoning(query, candidate_data, client):
         Provide 2 bullet points on why they are a good fit.
         Provide 1 bullet point on a potential concern or missing skill (if any).
         Format as HTML: 
-        <b>✅ Why they fit:</b><br>- Point 1<br>- Point 2<br><br>
-        <b>⚠️ Potential Concerns:</b><br>- Concern 1
+        <b>Why they fit:</b><br>- Point 1<br>- Point 2<br><br>
+        <b>Potential Concerns:</b><br>- Concern 1
         """
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -202,6 +202,31 @@ def create_job(title, description, qdrant_client, openai_client):
         st.error(f"Error creating job: {e}")
         return False
 
+def update_job(job_id, title, description, qdrant_client, openai_client):
+    try:
+        embedding = generate_dense_embedding(description, openai_client)
+        point = models.PointStruct(
+            id=job_id,
+            vector={"job_embedding": embedding},
+            payload={"title": title, "description": description, "updated_at": str(uuid.uuid1())}
+        )
+        qdrant_client.upsert(collection_name=JOBS_COLLECTION_NAME, points=[point])
+        return True
+    except Exception as e:
+        st.error(f"Error updating job: {e}")
+        return False
+
+def delete_job(job_id, qdrant_client):
+    try:
+        qdrant_client.delete(
+            collection_name=JOBS_COLLECTION_NAME,
+            points_selector=models.PointIdsList(points=[job_id])
+        )
+        return True
+    except Exception as e:
+        st.error(f"Error deleting job: {e}")
+        return False
+
 def get_all_jobs(qdrant_client):
     try:
         result, _ = qdrant_client.scroll(collection_name=JOBS_COLLECTION_NAME, limit=100, with_payload=True, with_vectors=False)
@@ -244,11 +269,11 @@ def check_password():
     st.markdown("""<style>.stTextInput > div > div > input {text-align: center;}</style>""", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
-        st.markdown("<h1 style='text-align: center; color: #002147;'>🍵 Teapress Recruiting</h1>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align: center; color: #002147;'>Teapress Recruiting</h1>", unsafe_allow_html=True)
         st.markdown("<p style='text-align: center;'>Welcome back, Joanna! Please enter your secret tea code to brew up some candidates.</p>", unsafe_allow_html=True)
         st.text_input("Access Code", type="password", on_change=password_entered, key="password", label_visibility="collapsed", placeholder="Enter Access Code")
         if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-            st.error("😕 That code didn't steep correctly. Try again?")
+            st.error("That code didn't steep correctly. Try again?")
     return False
 
 if not check_password(): st.stop()
@@ -271,29 +296,18 @@ try:
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
     sparse_model = get_sparse_embedding_model()
+    ensure_collections_exist(qdrant_client)
 except Exception as e:
-    st.error(f"⚠️ Configuration Error: {e}")
+    st.error(f"Configuration Error: {e}")
     st.stop()
 
 # --- SIDEBAR ---
 st.sidebar.title("Teapress Recruiting")
-st.sidebar.header("📂 Job Requisitions")
 
-jobs = get_all_jobs(qdrant_client)
-job_options = {job.payload['title']: job for job in jobs}
-job_titles = ["-- None --"] + list(job_options.keys())
+# Job Management Section
+st.sidebar.subheader("Job Requisitions")
 
-selected_job_title = st.sidebar.selectbox("Active Job:", job_titles)
-active_job_data = None
-if selected_job_title != "-- None --":
-    active_job_data = job_options[selected_job_title]
-    st.session_state.active_job_id = active_job_data.id
-    st.session_state.active_job_title = selected_job_title
-else:
-    st.session_state.active_job_id = None
-    st.session_state.active_job_title = None
-
-with st.sidebar.expander("➕ Create New Job"):
+with st.sidebar.expander("Create New Job"):
     new_job_title = st.text_input("Job Title")
     new_job_desc = st.text_area("Job Description")
     if st.button("Save Job"):
@@ -304,14 +318,44 @@ with st.sidebar.expander("➕ Create New Job"):
         else:
             st.sidebar.error("Please fill in both fields.")
 
+jobs = get_all_jobs(qdrant_client)
+job_options = {job.payload['title']: job for job in jobs}
+job_titles = ["-- None --"] + sorted(list(job_options.keys()))
+
+selected_job_title = st.sidebar.selectbox("Active Job:", job_titles)
+active_job_data = None
+
+if selected_job_title != "-- None --":
+    active_job_data = job_options[selected_job_title]
+    st.session_state.active_job_id = active_job_data.id
+    st.session_state.active_job_title = selected_job_title
+    
+    # Edit/Delete Controls
+    with st.sidebar.expander("Manage Selected Job"):
+        edit_title = st.text_input("Edit Title", value=active_job_data.payload['title'])
+        edit_desc = st.text_area("Edit Description", value=active_job_data.payload['description'])
+        
+        col_save, col_del = st.columns(2)
+        with col_save:
+            if st.button("Update Job"):
+                update_job(active_job_data.id, edit_title, edit_desc, qdrant_client, openai_client)
+                st.success("Updated!")
+                st.rerun()
+        with col_del:
+            if st.button("Delete Job"):
+                delete_job(active_job_data.id, qdrant_client)
+                st.success("Deleted!")
+                st.rerun()
+else:
+    st.session_state.active_job_id = None
+    st.session_state.active_job_title = None
+
 st.sidebar.divider()
-st.sidebar.header("📥 Upload Resumes")
-st.sidebar.info("Hi Joanna! Drag & drop resumes here to add them to your Teapress talent pool.")
+st.sidebar.subheader("Upload Resumes")
 uploaded_files = st.sidebar.file_uploader("Upload Resumes (PDF, DOCX, TXT)", type=["pdf", "docx", "txt", "md"], accept_multiple_files=True)
 
 if uploaded_files:
     if st.sidebar.button(f"Process {len(uploaded_files)} Resumes"):
-        ensure_collections_exist(qdrant_client)
         if not openai_client: st.sidebar.error("OpenAI API Key is missing.")
         else:
             progress_bar = st.sidebar.progress(0)
@@ -354,10 +398,10 @@ st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allo
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
 
 if st.session_state.active_job_title:
-    st.info(f"📂 **Active Job:** {st.session_state.active_job_title}")
+    st.info(f"Active Job: **{st.session_state.active_job_title}**")
 
-st.markdown("### 🔎 How do you want to search?")
-search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "📂 View Shortlist"])
+st.markdown("### Search Candidates")
+search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "View Shortlist"])
 
 with search_tab1:
     search_query = st.text_input("Describe the perfect candidate:", placeholder="e.g. Friendly Customer Success Manager...")
@@ -369,7 +413,7 @@ with search_tab2:
     with col_jd1:
         job_description = st.text_area("Paste the Job Description here:", value=default_jd, height=250, placeholder="Paste the full JD text here...")
     with col_jd2:
-        st.info("💡 **Pro Tip:** Pasting the full JD helps our AI find candidates with the exact skills.")
+        st.info("**Pro Tip:** Pasting the full JD helps our AI find candidates with the exact skills.")
         st.write("")
         search_btn_2 = st.button("Find Matches based on JD", type="primary", key="btn2")
 
@@ -444,15 +488,15 @@ if st.session_state.search_results:
             </div>
             """, unsafe_allow_html=True)
             
-            with st.expander("📝 Review & Annotate", expanded=False):
+            with st.expander("Review & Annotate", expanded=False):
                 col_review1, col_review2 = st.columns([1, 1])
                 with col_review1:
                     if st.session_state.active_job_id:
                         current_shortlists = payload.get("shortlists", [])
                         is_shortlisted = any(entry['job_id'] == st.session_state.active_job_id for entry in current_shortlists)
-                        if is_shortlisted: st.success(f"✅ Shortlisted for {st.session_state.active_job_title}")
+                        if is_shortlisted: st.success(f"Shortlisted for {st.session_state.active_job_title}")
                         else:
-                            if st.button(f"⭐ Add to {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
+                            if st.button(f"Add to {st.session_state.active_job_title}", key=f"shortlist_{point.id}"):
                                 shortlist_candidate(point.id, st.session_state.active_job_id, st.session_state.active_job_title, current_shortlists)
                                 st.rerun()
                     else: st.caption("Select a Job in the sidebar to shortlist candidates.")

@@ -16,6 +16,7 @@ st.set_page_config(page_title="Teapress Recruiting", layout="wide", initial_side
 # --- CONSTANTS ---
 COLLECTION_NAME = "resumes"
 JOBS_COLLECTION_NAME = "jobs"
+FEEDBACK_COLLECTION_NAME = "feedback"
 DENSE_VECTOR_NAME = "resume_embedding"
 SPARSE_VECTOR_NAME = "resume_keywords"
 DENSE_MODEL_NAME = "text-embedding-3-small"
@@ -182,6 +183,11 @@ def ensure_collections_exist(qdrant_client):
                 collection_name=JOBS_COLLECTION_NAME,
                 vectors_config={"job_embedding": models.VectorParams(size=1536, distance=models.Distance.COSINE)}
             )
+        if not qdrant_client.collection_exists(collection_name=FEEDBACK_COLLECTION_NAME):
+            qdrant_client.create_collection(
+                collection_name=FEEDBACK_COLLECTION_NAME,
+                vectors_config={} # No vectors needed for feedback log yet, or maybe just simple payload storage
+            )
         return True
     except Exception as e:
         st.error(f"Collection Init Error: {e}")
@@ -194,7 +200,7 @@ def create_job(title, description, qdrant_client, openai_client):
         point = models.PointStruct(
             id=point_id,
             vector={"job_embedding": embedding},
-            payload={"title": title, "description": description, "created_at": str(uuid.uuid1())}
+            payload={"title": title, "description": description, "created_at": str(uuid.uuid1()), "status": "Open"}
         )
         qdrant_client.upsert(collection_name=JOBS_COLLECTION_NAME, points=[point])
         return True
@@ -202,19 +208,46 @@ def create_job(title, description, qdrant_client, openai_client):
         st.error(f"Error creating job: {e}")
         return False
 
-def update_job(job_id, title, description, qdrant_client, openai_client):
+def update_job(job_id, title, description, status, qdrant_client, openai_client):
     try:
         embedding = generate_dense_embedding(description, openai_client)
         point = models.PointStruct(
             id=job_id,
             vector={"job_embedding": embedding},
-            payload={"title": title, "description": description, "updated_at": str(uuid.uuid1())}
+            payload={"title": title, "description": description, "updated_at": str(uuid.uuid1()), "status": status}
         )
         qdrant_client.upsert(collection_name=JOBS_COLLECTION_NAME, points=[point])
         return True
     except Exception as e:
         st.error(f"Error updating job: {e}")
         return False
+
+def save_feedback(query, job_id, rating, comment, qdrant_client):
+    try:
+        point_id = str(uuid.uuid4())
+        point = models.PointStruct(
+            id=point_id,
+            vector={},
+            payload={
+                "query": query,
+                "job_id": job_id,
+                "rating": rating, # "Good" or "Bad"
+                "comment": comment,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+        )
+        qdrant_client.upsert(collection_name=FEEDBACK_COLLECTION_NAME, points=[point])
+        return True
+    except Exception as e:
+        print(f"Error saving feedback: {e}")
+        return False
+
+def get_all_feedback(qdrant_client):
+    try:
+        result, _ = qdrant_client.scroll(collection_name=FEEDBACK_COLLECTION_NAME, limit=100, with_payload=True)
+        return sorted([p.payload for p in result], key=lambda x: x['timestamp'], reverse=True)
+    except Exception:
+        return []
 
 def delete_job(job_id, qdrant_client):
     try:
@@ -256,21 +289,36 @@ def shortlist_candidate(candidate_id, job_id, job_title, current_shortlists):
     return update_candidate_metadata(candidate_id, {"shortlists": updated_list})
 
 # --- AUTHENTICATION ---
+import hashlib
+
 def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state.password_correct = False
+    
+    # Simple hash for the token (in production, use something more secure)
+    secret_pass = st.secrets["auth"]["password"]
+    token_hash = hashlib.sha256(secret_pass.encode()).hexdigest()
+    
+    # Check query param
+    params = st.query_params
+    if params.get("auth_token") == token_hash:
+        st.session_state.password_correct = True
+    
     def password_entered():
-        if st.session_state["password"] == st.secrets["auth"]["password"]:
-            st.session_state["password_correct"] = True
+        if st.session_state["password"] == secret_pass:
+            st.session_state.password_correct = True
+            st.query_params["auth_token"] = token_hash
             del st.session_state["password"]
         else:
-            st.session_state["password_correct"] = False
+            st.session_state.password_correct = False
 
-    if st.session_state.get("password_correct", False): return True
+    if st.session_state.password_correct: return True
 
     st.markdown("""<style>.stTextInput > div > div > input {text-align: center;}</style>""", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
         st.markdown("<h1 style='text-align: center; color: #002147;'>Teapress Recruiting</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center;'>Welcome back, Joanna! Please enter your secret tea code to brew up some candidates.</p>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>Welcome back, Joanna! Please enter your secret tea code.</p>", unsafe_allow_html=True)
         st.text_input("Access Code", type="password", on_change=password_entered, key="password", label_visibility="collapsed", placeholder="Enter Access Code")
         if "password_correct" in st.session_state and not st.session_state["password_correct"]:
             st.error("That code didn't steep correctly. Try again?")
@@ -312,14 +360,23 @@ with st.sidebar:
 st.sidebar.subheader("Job Requisitions")
 
 jobs = get_all_jobs(qdrant_client)
-job_options = {job.payload['title']: job for job in jobs}
-# Options: Create New Job + existing jobs
-job_dropdown_options = ["Create New Job"] + sorted(list(job_options.keys()))
+# Sort jobs: Open first, then by name
+job_list = []
+for job in jobs:
+    title = job.payload['title']
+    status = job.payload.get('status', 'Open')
+    display_title = title if status == 'Open' else f"{title} (Closed)"
+    job_list.append({"display": display_title, "data": job, "status": status})
+
+# Sort: Open jobs first, then alphabetical
+job_list.sort(key=lambda x: (0 if x['status'] == 'Open' else 1, x['display']))
+
+job_options = {j['display']: j['data'] for j in job_list}
+job_dropdown_options = ["Create New Job"] + list(job_options.keys())
 
 # Ensure session state selector is valid
 if "job_selector" not in st.session_state:
     st.session_state.job_selector = job_dropdown_options[0] if len(job_options) == 0 else job_dropdown_options[1]
-    # Default to first job if exists, else Create
 
 # Handle case where selected job was deleted
 if st.session_state.job_selector not in job_dropdown_options:
@@ -347,7 +404,6 @@ if selected_option == "Create New Job":
             if new_job_title and new_job_desc:
                 if create_job(new_job_title, new_job_desc, qdrant_client, openai_client):
                     st.sidebar.success("Job Created!")
-                    # Auto-select the new job
                     st.session_state.job_selector = new_job_title
                     st.rerun()
             else:
@@ -357,20 +413,35 @@ else:
     # Existing Job Selected
     active_job_data = job_options[selected_option]
     st.session_state.active_job_id = active_job_data.id
-    st.session_state.active_job_title = selected_option
+    st.session_state.active_job_title = active_job_data.payload['title']
     
     # Condensed Job Info / Edit
+    current_status = active_job_data.payload.get('status', 'Open')
     with st.sidebar.expander("Manage Job Settings", expanded=False):
         edit_title = st.text_input("Edit Title", value=active_job_data.payload['title'])
         edit_desc = st.text_area("Edit Description", value=active_job_data.payload['description'])
+        edit_status = st.selectbox("Job Status", ["Open", "Closed"], index=0 if current_status == "Open" else 1)
         
         col_save, col_del = st.columns(2)
         with col_save:
             if st.button("Update Job"):
-                update_job(active_job_data.id, edit_title, edit_desc, qdrant_client, openai_client)
-                # If title changed, update selector
-                if edit_title != selected_option:
-                    st.session_state.job_selector = edit_title
+                # We need to update the update_job function to handle status, 
+                # but since we are replacing the call here, we must ensure the function exists or update it too.
+                # Since I cannot update the function definition in this specific block without replacing the whole file,
+                # I will handle the update strictly here or ensure I update the function definition in valid scope.
+                # Ideally, I should update the function definition in the 'JOB MANAGEMENT' section first. 
+                # HOWEVER, I can just update the payload directly here using qdrant_client if I want to be quick, 
+                # but better to update the helper function in a separate call or same call if possible.
+                # I will assume I will update the function definition in the next tool call or usage.
+                # WAIT: I will update the function definition in the SAME file replacement if possible or separate.
+                # Since this tool call targets lines 258->381, I CANNOT update the function definitions (lines 190+).
+                # So I will update the call here to pass status, and THEN I will immediately update the function definition in the next step.
+                update_job(active_job_data.id, edit_title, edit_desc, edit_status, qdrant_client, openai_client)
+                
+                # If title/status changed, update selector
+                new_display = edit_title if edit_status == 'Open' else f"{edit_title} (Closed)"
+                if new_display != selected_option:
+                    st.session_state.job_selector = new_display
                 st.success("Updated!")
                 st.rerun()
         with col_del:
@@ -613,3 +684,38 @@ if st.session_state.search_results:
                          st.text_area("Subject: Invitation to Interview", value=st.session_state[f"email_{point.id}"], height=200)
                          link_body = st.session_state[f"email_{point.id}"].replace('\n', '%0A')
                          st.markdown(f"[Open in Mail Client](mailto:?subject=Teapress%20Opportunity&body={link_body})")
+
+# --- FEEDBACK UI ---
+if st.session_state.search_results and st.session_state.last_query:
+    st.divider()
+    st.caption("How was the search quality for this query?")
+    col_fb1, col_fb2 = st.columns([1, 4])
+    with col_fb1:
+        feedback_sentiment = st.radio("Search Quality", ["Good", "Needs Improvement"], label_visibility="collapsed", horizontal=True, key="fb_sentiment")
+    
+    with col_fb2:
+        if feedback_sentiment == "Needs Improvement":
+            feedback_comment = st.text_input("What was missing or incorrect?", placeholder="e.g. Too many junior candidates...")
+            if st.button("Submit Feedback"):
+                job_id = st.session_state.active_job_id if st.session_state.active_job_id else "general"
+                save_feedback(st.session_state.last_query, job_id, "Bad", feedback_comment, qdrant_client)
+                st.toast("Thanks! We'll use this to improve.")
+        else:
+             if st.button("Mark as Good"):
+                job_id = st.session_state.active_job_id if st.session_state.active_job_id else "general"
+                save_feedback(st.session_state.last_query, job_id, "Good", "", qdrant_client)
+                st.toast("Thanks for the feedback!")
+
+# --- ADMIN VIEW ---
+with st.sidebar:
+    st.divider()
+    show_admin = st.toggle("Admin: Search Quality")
+
+if show_admin:
+    st.markdown("---")
+    st.title("Admin: Search Quality Review")
+    feedback_data = get_all_feedback(qdrant_client)
+    if feedback_data:
+        st.dataframe(feedback_data, use_container_width=True)
+    else:
+        st.info("No feedback collected yet.")

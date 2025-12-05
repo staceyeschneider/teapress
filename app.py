@@ -127,7 +127,7 @@ def extract_metadata(text, client):
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts structured data from resumes. Return a JSON object with keys: 'candidate_name' (string), 'skills' (list of strings), 'years_experience' (integer, total years), and 'location' (string, city/state)."},
+                {"role": "system", "content": "You are a helpful assistant that extracts structured data from resumes. Return a JSON object with keys: 'candidate_name' (string), 'skills' (list of strings), 'years_experience' (integer, total years), 'location' (string, city/state), 'current_title' (string, most recent job title), and 'recent_titles' (list of strings, last 3 job titles)."},
                 {"role": "user", "content": f"Extract metadata from this resume:\n\n{text[:4000]}"}
             ],
             response_format={"type": "json_object"}
@@ -143,26 +143,38 @@ def generate_search_reasoning(query, candidate_data, client):
     if not client: return "AI Reasoning unavailable."
     try:
         resume_snippet = candidate_data.get('text', '')[:1000]
+        # Fallback for older indexed candidates who might lack new fields
+        current_title = candidate_data.get('current_title', 'Unknown Title')
+        recent_titles = candidate_data.get('recent_titles', [])
+        location = candidate_data.get('location', 'Unknown Location')
+        
         prompt = f"""
         Query: "{query}"
         Candidate: {candidate_data.get('candidate_name')}
-        Skills: {candidate_data.get('skills')}
+        Current Role: {current_title}
+        Recent Roles: {', '.join(recent_titles)}
+        Location: {location}
         Resume Snippet: {resume_snippet}...
         
-        Analyze this candidate against the query.
-        Provide 2 bullet points on why they are a good fit.
-        Provide 1 bullet point on a potential concern or missing skill (if any).
-        Format as HTML: 
+        Analyze this candidate against the query with a critical recruiter eye.
+        
+        1. **Location Check**: If the query mentions a location, strictly analyze if the candidate's location ({location}) is compatible. (e.g. Marietta is close to Alpharetta, but not the same).
+        2. **Role Match**: If the query mentions a specific job title (e.g. Tax Manager), check if they have held that EXACT title recently.
+        
+        Output Format (HTML):
+        <b>Match Analysis:</b><br>
+        - [Location] (Assess distance/commute feasibility)<br>
+        - [Role] (Did they hold the specific title requested?)<br><br>
         <b>Why they fit:</b><br>- Point 1<br>- Point 2<br><br>
         <b>Potential Concerns:</b><br>- Concern 1
         """
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a critical recruiter assistant. Be concise."},
+                {"role": "system", "content": "You are a critical recruiter assistant. Be concise and factual."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=150
+            max_tokens=250
         )
         content = response.choices[0].message.content
         return content.replace("```html", "").replace("```", "").strip()
@@ -647,7 +659,10 @@ if st.session_state.search_results:
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     st.markdown(f"<h3 style='margin:0; color:#002147;'>{payload.get('candidate_name', 'Unknown')}</h3>", unsafe_allow_html=True)
-                    st.markdown(f"**{payload.get('location', 'Unknown')}** • {payload.get('years_experience', 0)} Years Exp")
+                    current_title = payload.get('current_title', getattr(payload, 'recent_titles', ['Unknown Role'])[0] if payload.get('recent_titles') else "")
+                    if not current_title: current_title = "Candidate"
+                    st.markdown(f"**{current_title}**")
+                    st.markdown(f"<span style='color:#666'>{payload.get('location', 'Unknown')} • {payload.get('years_experience', 0)} Years Exp</span>", unsafe_allow_html=True)
                 with c2:
                     st.markdown(f"""
                         <div style="text-align:right;">
@@ -789,7 +804,69 @@ with st.sidebar:
 
 if show_admin:
     st.markdown("---")
-    st.title("Admin: Search Quality Review")
+    st.title("Admin Dashboard")
+    
+    st.subheader("Data Maintenance")
+    st.info("Use this to update candidate records with the latest AI extraction logic (e.g. new fields like 'Current Title').")
+    
+    if st.button("Re-analyze All Candidates"):
+        with st.spinner("Fetching candidates..."):
+            all_points = []
+            offset = None
+            while True:
+                batch, offset = qdrant_client.scroll(
+                    collection_name=COLLECTION_NAME,
+                    with_payload=True,
+                    limit=100,
+                    offset=offset
+                )
+                all_points.extend(batch)
+                if offset is None: break
+        
+        if not all_points:
+            st.warning("No candidates found to process.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            updated_count = 0
+            
+            for i, point in enumerate(all_points):
+                # Skip if text is missing
+                if 'text' not in point.payload: continue
+                
+                status_text.text(f"Updating {point.payload.get('candidate_name', 'Unknown')}...")
+                
+                # Re-extract
+                try:
+                    new_meta = extract_metadata(point.payload['text'], openai_client)
+                    
+                    # Merge but preserve essential existing data like ID/Notes if any (though notes are separate usually)
+                    # We only want to update the AI extracted fields
+                    update_payload = {
+                        "candidate_name": new_meta.get("candidate_name") or point.payload.get("candidate_name"),
+                        "skills": new_meta.get("skills", point.payload.get("skills")),
+                        "years_experience": new_meta.get("years_experience", point.payload.get("years_experience")),
+                        "location": new_meta.get("location", point.payload.get("location")),
+                        "current_title": new_meta.get("current_title"),
+                        "recent_titles": new_meta.get("recent_titles", [])
+                    }
+                    
+                    qdrant_client.set_payload(
+                        collection_name=COLLECTION_NAME,
+                        payload=update_payload,
+                        points=[point.id]
+                    )
+                    updated_count += 1
+                except Exception as e:
+                    print(f"Failed to update {point.id}: {e}")
+                
+                progress_bar.progress((i + 1) / len(all_points))
+            
+            st.success(f"Successfully re-analyzed {updated_count} candidates!")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Search Quality Review")
     feedback_data = get_all_feedback(qdrant_client)
     if feedback_data:
         st.dataframe(feedback_data, use_container_width=True)

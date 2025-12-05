@@ -494,6 +494,42 @@ if uploaded_files:
                 with st.sidebar.expander("See details"):
                     for err in errors: st.write(f"- {err}")
 
+# --- REFINEMENT LOGIC ---
+def refine_query_with_feedback(current_query, feedback_list, client):
+    if not feedback_list: return current_query
+    
+    # Format feedback for LLM
+    feedback_text = "\n".join([f"- Candidate: {f['name']} | Rating: {f['rating']} | Reason: {f['reason']}" for f in feedback_list])
+    
+    prompt = f"""
+    Refine this search query based on recruiter feedback on specific candidates.
+    
+    Original Query: "{current_query}"
+    
+    Recruiter Feedback:
+    {feedback_text}
+    
+    Task: Rewrite the query to better capture the recruiter's intent. 
+    - If they liked a candidate,emphasize those skills/traits.
+    - If they disliked a candidate, explicitly exclude or deprioritize those traits.
+    - Keep the query concise (under 50 words) but specific.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return current_query
+
+# --- SEARCH STATE ---
+if "search_results" not in st.session_state: st.session_state.search_results = []
+if "last_query" not in st.session_state: st.session_state.last_query = ""
+if "feedback_buffer" not in st.session_state: st.session_state.feedback_buffer = []
+
 # --- MAIN AREA ---
 st.markdown('<div class="main-header">Teapress Talent Search</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Welcome back, Joanna. Let\'s find your next great hire.</div>', unsafe_allow_html=True)
@@ -510,11 +546,24 @@ else:
     st.info("Please select a **Job Requisition** from the sidebar to start searching.")
 
 st.markdown("### Search Candidates")
+
+# Search Controls
+with st.expander("Search Filters", expanded=False):
+    min_score = st.slider("Minimum Match Score (%)", 0, 100, 60, step=5) / 100.0
+
 search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "View Shortlist"])
 
 with search_tab1:
-    search_query = st.text_input("Describe the perfect candidate:", placeholder="e.g. Friendly Customer Success Manager...")
-    search_btn_1 = st.button("Find Matches", type="primary", key="btn1")
+    col_q1, col_q2 = st.columns([4, 1])
+    with col_q1:
+        # If we have refined the query, pre-fill it.
+        # We use a temp key if needed, or update session state logic
+        default_query = st.session_state.get("refined_query", "")
+        search_query = st.text_input("Describe the perfect candidate:", value=default_query, placeholder="e.g. Friendly Customer Success Manager...")
+    with col_q2:
+        st.write("")
+        st.write("")
+        search_btn_1 = st.button("Find Matches", type="primary", key="btn1")
 
 with search_tab2:
     default_jd = active_job_data.payload['description'] if active_job_data else ""
@@ -526,9 +575,20 @@ with search_tab2:
         st.write("")
         search_btn_2 = st.button("Find Matches based on JD", type="primary", key="btn2")
 
-# --- SEARCH STATE ---
-if "search_results" not in st.session_state: st.session_state.search_results = []
-if "last_query" not in st.session_state: st.session_state.last_query = ""
+# Refinement Action (Visible if feedback exists)
+if st.session_state.feedback_buffer:
+    st.info(f"You have provided feedback on {len(st.session_state.feedback_buffer)} candidates.")
+    if st.button("✨ Refine & Rerun Search"):
+        with st.spinner("Refining your search strategy..."):
+            base_query = search_query if search_query else (job_description if job_description else st.session_state.last_query)
+            refined_query = refine_query_with_feedback(base_query, st.session_state.feedback_buffer, openai_client)
+            st.session_state.refined_query = refined_query # Store for the text input
+            st.session_state.last_query = refined_query
+            # Rerun search immediately
+            results = hybrid_search(refined_query, qdrant_client, openai_client, sparse_model, limit=20)
+            st.session_state.search_results = results
+            st.session_state.feedback_buffer = [] # Clear buffer after refinement
+            st.rerun()
 
 active_query = ""
 if search_btn_1 and search_query: active_query = search_query
@@ -565,15 +625,14 @@ if st.session_state.search_results:
     for point in results:
         status = point.payload.get("status", "New")
         if status == "Ignored" and not show_ignored: continue
+        # Score Filter
+        if point.score < min_score: continue
+        
         visible_results.append(point)
 
-    if not visible_results: st.warning("No active candidates found (check 'Show Ignored' if you archived them).")
+    if not visible_results: st.warning("No active candidates found matching criteria.")
     else:
-        top_score = visible_results[0].score if visible_results else 0
-        if top_score < 0.7 and "Shortlist" not in st.session_state.last_query:
-            st.warning(f"Found candidates, but match scores are low (Top: {int(top_score*100)}%). Consider refining your search.")
-        else:
-            st.success(f"Showing {len(visible_results)} candidates for: '{st.session_state.last_query[:50]}...'")
+        st.success(f"Showing {len(visible_results)} candidates for: '{st.session_state.last_query[:50]}...'")
 
         for point in visible_results:
             payload = point.payload
@@ -590,7 +649,6 @@ if st.session_state.search_results:
                     st.markdown(f"<h3 style='margin:0; color:#002147;'>{payload.get('candidate_name', 'Unknown')}</h3>", unsafe_allow_html=True)
                     st.markdown(f"**{payload.get('location', 'Unknown')}** • {payload.get('years_experience', 0)} Years Exp")
                 with c2:
-                    match_color = "green" if score > 0.8 else "orange" if score > 0.7 else "red"
                     st.markdown(f"""
                         <div style="text-align:right;">
                             <span style="background-color:#E0E7FF; padding:4px 10px; border-radius:12px; font-weight:bold; color:#002147;">
@@ -611,6 +669,24 @@ if st.session_state.search_results:
                         {reasoning}
                     </div>
                     """, unsafe_allow_html=True)
+                    
+                    # --- NEW: Candidate Feedback for Refinement ---
+                    with st.expander("Improve Future Searches", expanded=False):
+                        st.caption("Help the system learn. Why is this candidate a Good or Bad match for this job?")
+                        fb_col1, fb_col2 = st.columns([1, 3])
+                        with fb_col1:
+                            fb_type = st.radio("Verdict", ["Good Match", "Bad Match"], key=f"fb_type_{point.id}", label_visibility="collapsed")
+                        with fb_col2:
+                            fb_reason = st.text_input("Reasoning (e.g. 'Expert in Python', 'Too Junior')", key=f"fb_reason_{point.id}")
+                        
+                        if st.button("Log Feedback", key=f"log_fb_{point.id}"):
+                            # Add to session buffer
+                            st.session_state.feedback_buffer.append({
+                                "name": payload.get('candidate_name'),
+                                "rating": fb_type,
+                                "reason": fb_reason
+                            })
+                            st.toast("Feedback logged! Click 'Refine & Rerun' above when ready.")
                 
                 with tab_resume:
                     st.text_area("Resume Content", payload.get('text', ''), height=400, label_visibility="collapsed", key=f"resume_{point.id}")

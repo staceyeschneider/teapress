@@ -307,35 +307,56 @@ st.sidebar.title("Teapress Recruiting")
 # Job Management Section
 st.sidebar.subheader("Job Requisitions")
 
-# Create Job Logic
-with st.sidebar.expander("Create New Job"):
-    new_job_title = st.text_input("Job Title")
-    new_job_desc = st.text_area("Job Description")
-    if st.button("Save Job"):
-        if new_job_title and new_job_desc:
-            if create_job(new_job_title, new_job_desc, qdrant_client, openai_client):
-                st.sidebar.success("Job Created!")
-                st.rerun() # Force reload to show new job in list
-        else:
-            st.sidebar.error("Please fill in both fields.")
-
-# Job Selection Logic
 jobs = get_all_jobs(qdrant_client)
 job_options = {job.payload['title']: job for job in jobs}
-job_titles = ["-- Select a Job --"] + sorted(list(job_options.keys()))
+# Options: Create New Job + existing jobs
+job_dropdown_options = ["➕ Create New Job"] + sorted(list(job_options.keys()))
 
-# Use session state to persist selection across reruns if needed, 
-# but selectbox usually handles this. We'll stick to selectbox for simplicity.
-selected_job_title = st.sidebar.selectbox("Active Job:", job_titles)
+# Ensure session state selector is valid
+if "job_selector" not in st.session_state:
+    st.session_state.job_selector = job_dropdown_options[0] if len(job_options) == 0 else job_dropdown_options[1]
+    # Default to first job if exists, else Create
+
+# Handle case where selected job was deleted
+if st.session_state.job_selector not in job_dropdown_options:
+    st.session_state.job_selector = job_dropdown_options[0]
+
+selected_option = st.sidebar.selectbox(
+    "Select Active Job:", 
+    job_dropdown_options, 
+    key="job_selector"
+)
 active_job_data = None
 
-if selected_job_title != "-- Select a Job --":
-    active_job_data = job_options[selected_job_title]
-    st.session_state.active_job_id = active_job_data.id
-    st.session_state.active_job_title = selected_job_title
+# Render UI based on selection
+if selected_option == "➕ Create New Job":
+    st.session_state.active_job_id = None
+    st.session_state.active_job_title = None
     
-    # Edit/Delete Controls
-    with st.sidebar.expander("Manage Selected Job"):
+    st.sidebar.markdown("### Define New Role")
+    with st.sidebar.form("create_job_form", clear_on_submit=True):
+        new_job_title = st.text_input("Job Title")
+        new_job_desc = st.text_area("Job Description")
+        submitted = st.form_submit_button("Save Job")
+        
+        if submitted:
+            if new_job_title and new_job_desc:
+                if create_job(new_job_title, new_job_desc, qdrant_client, openai_client):
+                    st.sidebar.success("Job Created!")
+                    # Auto-select the new job
+                    st.session_state.job_selector = new_job_title
+                    st.rerun()
+            else:
+                st.sidebar.error("Please fill in both fields.")
+
+else:
+    # Existing Job Selected
+    active_job_data = job_options[selected_option]
+    st.session_state.active_job_id = active_job_data.id
+    st.session_state.active_job_title = selected_option
+    
+    # Condensed Job Info / Edit
+    with st.sidebar.expander("Manage Job Settings", expanded=False):
         edit_title = st.text_input("Edit Title", value=active_job_data.payload['title'])
         edit_desc = st.text_area("Edit Description", value=active_job_data.payload['description'])
         
@@ -343,16 +364,17 @@ if selected_job_title != "-- Select a Job --":
         with col_save:
             if st.button("Update Job"):
                 update_job(active_job_data.id, edit_title, edit_desc, qdrant_client, openai_client)
+                # If title changed, update selector
+                if edit_title != selected_option:
+                    st.session_state.job_selector = edit_title
                 st.success("Updated!")
                 st.rerun()
         with col_del:
             if st.button("Delete Job"):
                 delete_job(active_job_data.id, qdrant_client)
+                st.session_state.job_selector = "➕ Create New Job"
                 st.success("Deleted!")
                 st.rerun()
-else:
-    st.session_state.active_job_id = None
-    st.session_state.active_job_title = None
 
 st.sidebar.divider()
 st.sidebar.subheader("Upload Resumes")

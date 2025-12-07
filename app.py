@@ -106,21 +106,49 @@ def index_resume(text, metadata, qdrant_client, openai_client, sparse_model):
 
 # --- SEARCH & AI ---
 def hybrid_search(query_text, qdrant_client, openai_client, sparse_model, limit=20):
-    dense_vec = generate_dense_embedding(query_text, openai_client)
-    sparse_vec = generate_sparse_embedding(query_text, sparse_model)
+    try:
+        dense_vec = generate_dense_embedding(query_text, openai_client)
+        sparse_vec = generate_sparse_embedding(query_text, sparse_model)
+    except Exception as e:
+        print(f"Embedding generation failed: {e}")
+        return []
     
     # Increase prefetch limit massively to ensure RRF has enough candidates to intersect
-    prefetch_dense = models.Prefetch(query=dense_vec, using=DENSE_VECTOR_NAME, limit=limit * 5)
-    prefetch_sparse = models.Prefetch(query=sparse_vec, using=SPARSE_VECTOR_NAME, limit=limit * 5)
+    # If using RRF, we need results from BOTH. If one fails, we might get nothing.
+    # Improved Strategy: Fetch MORE, and if dense fails (low score), keyword might save it.
     
-    results = qdrant_client.query_points(
-        collection_name=COLLECTION_NAME,
-        prefetch=[prefetch_dense, prefetch_sparse],
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=limit,
-        with_payload=True
-    )
-    return results.points
+    prefetch_dense = models.Prefetch(query=dense_vec, using=DENSE_VECTOR_NAME, limit=limit * 10)
+    prefetch_sparse = models.Prefetch(query=sparse_vec, using=SPARSE_VECTOR_NAME, limit=limit * 10)
+    
+    try:
+        results = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME,
+            prefetch=[prefetch_dense, prefetch_sparse],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=limit,
+            with_payload=True
+        )
+        points = results.points
+    except Exception as e:
+        print(f"Hybrid search failed: {e}")
+        points = []
+
+    # FALLBACK: If hybrid returns nothing, try pure Keyword Search (Sparse)
+    if not points:
+        try:
+             results = qdrant_client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=models.NamedVector(
+                    name=SPARSE_VECTOR_NAME,
+                    vector=sparse_vec,
+                ),
+                limit=limit,
+                with_payload=True
+            )
+             points = results
+        except Exception: pass
+        
+    return points
 
 def extract_metadata(text, client):
     if not client: return {}
@@ -369,7 +397,7 @@ with st.sidebar:
         "assets/teapress_logo.png",
         os.path.join(os.path.dirname(__file__), "assets/teapress_logo.png"),
         os.path.join(os.getcwd(), "assets/teapress_logo.png"),
-        "/Users/staceyschneider/.gemini/antigravity/scratch/resume_search_dashboard/assets/teapress_logo.png"
+        "/mount/src/teapress/assets/teapress_logo.png"
     ]
     logo_path = None
     for p in potential_paths:
@@ -380,9 +408,15 @@ with st.sidebar:
     if logo_path:
         st.image(logo_path, use_container_width=True)
     else:
-        # Fallback if really not found
-        st.warning(f"Logo missing. Checked: {potential_paths}")
-        st.title("Teapress Recruiting")
+        # Fallback Style
+        st.markdown("""
+        <div style="text-align: left; padding-bottom: 20px;">
+            <h1 style="font-family: 'Helvetica Neue', sans-serif; font-size: 2.5rem; font-weight: 700; color: #000000; margin:0;">
+                <span style="border-bottom: 3px solid #000000; padding-bottom: 5px;">TEA</span>PRESS
+            </h1>
+        </div>
+        """, unsafe_allow_html=True)
+        st.info("Tip: To enable the logo image on Streamlit Cloud, ensure `assets/teapress_logo.png` is committed to your GitHub repository.")
     
     # Total Count Display
     try:
@@ -915,9 +949,14 @@ if show_admin:
             
     with admin_tab2:
         st.subheader("Re-Analyze Metadata")
-        st.info("Use this to update candidate records with the latest AI extraction logic (e.g. new fields like 'Current Title').")
+        st.warning("⚠️ **Missing Job Titles or Locations?** Run this to backfill missing data for existing candidates.")
+        st.markdown("""
+        If you uploaded candidates *before* the latest AI update, they might lack structured fields like `Current Title` or `Recent Roles`.
         
-        if st.button("Re-analyze All Candidates"):
+        **Action:** Click the button below to have the AI re-read every resume in the database and update these fields.
+        """)
+        
+        if st.button("Re-analyze All Candidates (Backfill Data)"):
             with st.spinner("Fetching candidates..."):
                 all_points = []
                 offset = None

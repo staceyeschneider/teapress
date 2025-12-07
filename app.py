@@ -394,9 +394,12 @@ except Exception as e:
 with st.sidebar:
     # Try multiple paths to locate the logo
     potential_paths = [
+        "teapress_logo.png",
+        "logo.png",
         "assets/teapress_logo.png",
+        os.path.join(os.path.dirname(__file__), "teapress_logo.png"),
         os.path.join(os.path.dirname(__file__), "assets/teapress_logo.png"),
-        os.path.join(os.getcwd(), "assets/teapress_logo.png"),
+        "/mount/src/teapress/teapress_logo.png",
         "/mount/src/teapress/assets/teapress_logo.png"
     ]
     logo_path = None

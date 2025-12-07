@@ -109,8 +109,9 @@ def hybrid_search(query_text, qdrant_client, openai_client, sparse_model, limit=
     dense_vec = generate_dense_embedding(query_text, openai_client)
     sparse_vec = generate_sparse_embedding(query_text, sparse_model)
     
-    prefetch_dense = models.Prefetch(query=dense_vec, using=DENSE_VECTOR_NAME, limit=limit * 2)
-    prefetch_sparse = models.Prefetch(query=sparse_vec, using=SPARSE_VECTOR_NAME, limit=limit * 2)
+    # Increase prefetch limit massively to ensure RRF has enough candidates to intersect
+    prefetch_dense = models.Prefetch(query=dense_vec, using=DENSE_VECTOR_NAME, limit=limit * 5)
+    prefetch_sparse = models.Prefetch(query=sparse_vec, using=SPARSE_VECTOR_NAME, limit=limit * 5)
     
     results = qdrant_client.query_points(
         collection_name=COLLECTION_NAME,
@@ -363,11 +364,24 @@ except Exception as e:
 
 # --- SIDEBAR ---
 with st.sidebar:
-    logo_path = os.path.join(os.path.dirname(__file__), "assets/teapress_logo.png")
-    if os.path.exists(logo_path):
+    # Try multiple paths to locate the logo
+    potential_paths = [
+        "assets/teapress_logo.png",
+        os.path.join(os.path.dirname(__file__), "assets/teapress_logo.png"),
+        os.path.join(os.getcwd(), "assets/teapress_logo.png"),
+        "/Users/staceyschneider/.gemini/antigravity/scratch/resume_search_dashboard/assets/teapress_logo.png"
+    ]
+    logo_path = None
+    for p in potential_paths:
+        if os.path.exists(p):
+            logo_path = p
+            break
+            
+    if logo_path:
         st.image(logo_path, use_container_width=True)
     else:
-        st.error(f"Logo not found at: {logo_path}")
+        # Fallback if really not found
+        st.warning(f"Logo missing. Checked: {potential_paths}")
         st.title("Teapress Recruiting")
     
     # Total Count Display
@@ -570,7 +584,7 @@ st.markdown("### Search Candidates")
 
 # Search Controls
 with st.expander("Search Filters", expanded=False):
-    min_score = st.slider("Minimum Match Score (%)", 0, 100, 60, step=5) / 100.0
+    min_score = st.slider("Minimum Match Score (%)", 0, 100, 30, step=5) / 100.0
 
 search_tab1, search_tab2, search_tab3 = st.tabs(["Quick Search", "Match with Job Description", "View Shortlist"])
 
@@ -606,7 +620,7 @@ if st.session_state.feedback_buffer:
             st.session_state.refined_query = refined_query # Store for the text input
             st.session_state.last_query = refined_query
             # Rerun search immediately
-            results = hybrid_search(refined_query, qdrant_client, openai_client, sparse_model, limit=20)
+            results = hybrid_search(refined_query, qdrant_client, openai_client, sparse_model, limit=100)
             st.session_state.search_results = results
             st.session_state.feedback_buffer = [] # Clear buffer after refinement
             st.rerun()
@@ -621,7 +635,7 @@ if active_query:
     else:
         with st.spinner("Searching candidates..."):
             try:
-                results = hybrid_search(active_query, qdrant_client, openai_client, sparse_model, limit=20)
+                results = hybrid_search(active_query, qdrant_client, openai_client, sparse_model, limit=100)
                 st.session_state.search_results = results
             except Exception as e: st.error(f"Search Error: {e}")
 
@@ -651,7 +665,11 @@ if st.session_state.search_results:
         
         visible_results.append(point)
 
-    if not visible_results: st.warning("No active candidates found matching criteria.")
+    if not visible_results:
+        if len(results) > 0:
+             st.warning(f"Found {len(results)} potential matches, but they all scored below {int(min_score*100)}%. Expand 'Search Filters' above to lower the threshold.")
+        else:
+             st.warning("No candidates found matching that query.")
     else:
         st.success(f"Showing {len(visible_results)} candidates for: '{st.session_state.last_query[:50]}...'")
 

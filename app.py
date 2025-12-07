@@ -363,9 +363,11 @@ except Exception as e:
 
 # --- SIDEBAR ---
 with st.sidebar:
-    try:
-        st.image("assets/teapress_logo.png", use_container_width=True)
-    except:
+    logo_path = os.path.join(os.path.dirname(__file__), "assets/teapress_logo.png")
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+    else:
+        st.error(f"Logo not found at: {logo_path}")
         st.title("Teapress Recruiting")
     
     # Total Count Display
@@ -816,12 +818,82 @@ if show_admin:
     admin_tab1, admin_tab2, admin_tab3 = st.tabs(["Search Quality Reviews", "Data Maintenance", "Database Inspector"])
     
     with admin_tab1:
-        st.subheader("Search Feedback")
+        st.subheader("Feedback-Driven Optimization")
+        st.info("Review feedback for each job and let AI refine the Job Description to improve future results.")
+        
         feedback_data = get_all_feedback(qdrant_client)
-        if feedback_data:
-            st.dataframe(feedback_data, use_container_width=True)
+        if not feedback_data:
+            st.warning("No feedback collected yet.")
         else:
-            st.info("No feedback collected yet.")
+            # Group by Job
+            feedback_by_job = {}
+            for item in feedback_data:
+                jid = item.get('job_id', 'general')
+                if jid not in feedback_by_job: feedback_by_job[jid] = []
+                feedback_by_job[jid].append(item)
+            
+            # Helper to get job title
+            all_jobs = get_all_jobs(qdrant_client)
+            job_map = {j.id: j.payload for j in all_jobs}
+            
+            for jid, items in feedback_by_job.items():
+                job_title = job_map.get(jid, {}).get('title', 'General / Deleted Job')
+                current_desc = job_map.get(jid, {}).get('description', '')
+                
+                with st.expander(f"Job: {job_title} ({len(items)} feedback entries)"):
+                    # Metrics
+                    good_fb = [i for i in items if i['rating'] == 'Good']
+                    bad_fb = [i for i in items if i['rating'] != 'Good']
+                    
+                    c1, c2 = st.columns(2)
+                    c1.metric("👍 Good Matches", len(good_fb))
+                    c2.metric("👎 Poor Matches", len(bad_fb))
+                    
+                    if bad_fb:
+                        st.markdown("**Critical Feedback (What to avoid):**")
+                        for item in bad_fb:
+                            st.text(f"- {item.get('comment', 'No comment')}")
+                    
+                    if current_desc:
+                        st.divider()
+                        st.markdown("**Optimize Search Criteria**")
+                        if st.button(f"Generate Improved JD for '{job_title}'", key=f"opt_{jid}"):
+                            with st.spinner("Analyzing feedback and rewriting JD..."):
+                                bad_comments = "\n".join([f"- {i.get('comment')}" for i in bad_fb])
+                                prompt = f"""
+                                I have a Job Description and a list of "Bad Match" feedback from a recruiter.
+                                Please rewrite the Job Description to explicitly CLARIFY requirements to avoid these bad matches in the future.
+                                
+                                Current JD:
+                                {current_desc}
+                                
+                                Recruiter Feedback (What they HATED):
+                                {bad_comments}
+                                
+                                Instructions:
+                                1. Keep the core responsibilities.
+                                2. Add specific "Must Haves" or "Anti-Patterns" based on the feedback (e.g. if they said "No manufacturing", add "Candidates from manufacturing backgrounds will not be considered").
+                                3. Keep it professional.
+                                """
+                                try:
+                                    response = openai_client.chat.completions.create(
+                                        model="gpt-4o",
+                                        messages=[{"role": "user", "content": prompt}]
+                                    )
+                                    st.session_state[f"new_jd_{jid}"] = response.choices[0].message.content
+                                except Exception as e:
+                                    st.error(f"Optimization failed: {e}")
+                        
+                        if f"new_jd_{jid}" in st.session_state:
+                            new_jd_text = st.text_area("Proposed New JD", value=st.session_state[f"new_jd_{jid}"], height=300)
+                            if st.button("Save & Update Job", key=f"save_{jid}"):
+                                # Update job status is unknown here without fetching, assume 'Open' or keep existing if complex. 
+                                # For simplicity, we use 'Open' as we are actively optimizing it.
+                                if update_job(jid, job_title, new_jd_text, "Open", qdrant_client, openai_client):
+                                    st.success("Job Description Updated! Future searches will be better.")
+                                    # Clear state
+                                    del st.session_state[f"new_jd_{jid}"]
+                                    st.rerun()
             
     with admin_tab2:
         st.subheader("Re-Analyze Metadata")
@@ -897,7 +969,7 @@ if show_admin:
         with insp_col1:
             insp_limit = st.number_input("Limit", 10, 100, 20)
         with insp_col2:
-            insp_offset = st.number_input("Offset point ID (leave blank for start)", value="")
+            insp_offset = st.text_input("Offset point ID (leave blank for start)", value="")
             
         if st.button("Fetch Records"):
             try:

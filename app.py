@@ -367,6 +367,13 @@ with st.sidebar:
         st.image("assets/teapress_logo.png", use_container_width=True)
     except:
         st.title("Teapress Recruiting")
+    
+    # Total Count Display
+    try:
+        total_candidates = qdrant_client.count(collection_name=COLLECTION_NAME).count
+        st.markdown(f"**Total Candidates:** {total_candidates}")
+    except:
+        st.markdown("**Total Candidates:** 0")
 
 # Job Management Section
 st.sidebar.subheader("Job Requisitions")
@@ -806,69 +813,113 @@ if show_admin:
     st.markdown("---")
     st.title("Admin Dashboard")
     
-    st.subheader("Data Maintenance")
-    st.info("Use this to update candidate records with the latest AI extraction logic (e.g. new fields like 'Current Title').")
+    admin_tab1, admin_tab2, admin_tab3 = st.tabs(["Search Quality Reviews", "Data Maintenance", "Database Inspector"])
     
-    if st.button("Re-analyze All Candidates"):
-        with st.spinner("Fetching candidates..."):
-            all_points = []
-            offset = None
-            while True:
-                batch, offset = qdrant_client.scroll(
+    with admin_tab1:
+        st.subheader("Search Feedback")
+        feedback_data = get_all_feedback(qdrant_client)
+        if feedback_data:
+            st.dataframe(feedback_data, use_container_width=True)
+        else:
+            st.info("No feedback collected yet.")
+            
+    with admin_tab2:
+        st.subheader("Re-Analyze Metadata")
+        st.info("Use this to update candidate records with the latest AI extraction logic (e.g. new fields like 'Current Title').")
+        
+        if st.button("Re-analyze All Candidates"):
+            with st.spinner("Fetching candidates..."):
+                all_points = []
+                offset = None
+                while True:
+                    batch, offset = qdrant_client.scroll(
+                        collection_name=COLLECTION_NAME,
+                        with_payload=True,
+                        limit=100,
+                        offset=offset
+                    )
+                    all_points.extend(batch)
+                    if offset is None: break
+            
+            if not all_points:
+                st.warning("No candidates found to process.")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                updated_count = 0
+                
+                for i, point in enumerate(all_points):
+                    if 'text' not in point.payload: continue
+                    status_text.text(f"Updating {point.payload.get('candidate_name', 'Unknown')}...")
+                    try:
+                        new_meta = extract_metadata(point.payload['text'], openai_client)
+                        update_payload = {
+                            "candidate_name": new_meta.get("candidate_name") or point.payload.get("candidate_name"),
+                            "skills": new_meta.get("skills", point.payload.get("skills")),
+                            "years_experience": new_meta.get("years_experience", point.payload.get("years_experience")),
+                            "location": new_meta.get("location", point.payload.get("location")),
+                            "current_title": new_meta.get("current_title"),
+                            "recent_titles": new_meta.get("recent_titles", [])
+                        }
+                        qdrant_client.set_payload(collection_name=COLLECTION_NAME, payload=update_payload, points=[point.id])
+                        updated_count += 1
+                    except Exception as e:
+                        print(f"Failed to update {point.id}: {e}")
+                    progress_bar.progress((i + 1) / len(all_points))
+                
+                st.success(f"Successfully re-analyzed {updated_count} candidates!")
+                st.rerun()
+
+    with admin_tab3:
+        st.subheader("Vector Database Inspector")
+        
+        # Collection Stats
+        c1, c2, c3 = st.columns(3)
+        try:
+            cnt_resumes = qdrant_client.count(collection_name=COLLECTION_NAME).count
+            c1.metric("Resumes", cnt_resumes)
+        except: c1.metric("Resumes", "Error")
+        
+        try:
+            cnt_jobs = qdrant_client.count(collection_name=JOBS_COLLECTION_NAME).count
+            c2.metric("Jobs", cnt_jobs)
+        except: c2.metric("Jobs", "Error")
+        
+        try:
+            cnt_fb = qdrant_client.count(collection_name=FEEDBACK_COLLECTION_NAME).count
+            c3.metric("Feedback Entries", cnt_fb)
+        except: c3.metric("Feedback", "Error")
+        
+        st.divider()
+        st.write("**Browse Resume Collection**")
+        
+        insp_col1, insp_col2 = st.columns([1, 1])
+        with insp_col1:
+            insp_limit = st.number_input("Limit", 10, 100, 20)
+        with insp_col2:
+            insp_offset = st.number_input("Offset point ID (leave blank for start)", value="")
+            
+        if st.button("Fetch Records"):
+            try:
+                scroll_offset = str(insp_offset) if insp_offset else None
+                points, next_offset = qdrant_client.scroll(
                     collection_name=COLLECTION_NAME,
                     with_payload=True,
-                    limit=100,
-                    offset=offset
+                    limit=insp_limit,
+                    offset=scroll_offset
                 )
-                all_points.extend(batch)
-                if offset is None: break
-        
-        if not all_points:
-            st.warning("No candidates found to process.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            updated_count = 0
-            
-            for i, point in enumerate(all_points):
-                # Skip if text is missing
-                if 'text' not in point.payload: continue
                 
-                status_text.text(f"Updating {point.payload.get('candidate_name', 'Unknown')}...")
-                
-                # Re-extract
-                try:
-                    new_meta = extract_metadata(point.payload['text'], openai_client)
-                    
-                    # Merge but preserve essential existing data like ID/Notes if any (though notes are separate usually)
-                    # We only want to update the AI extracted fields
-                    update_payload = {
-                        "candidate_name": new_meta.get("candidate_name") or point.payload.get("candidate_name"),
-                        "skills": new_meta.get("skills", point.payload.get("skills")),
-                        "years_experience": new_meta.get("years_experience", point.payload.get("years_experience")),
-                        "location": new_meta.get("location", point.payload.get("location")),
-                        "current_title": new_meta.get("current_title"),
-                        "recent_titles": new_meta.get("recent_titles", [])
-                    }
-                    
-                    qdrant_client.set_payload(
-                        collection_name=COLLECTION_NAME,
-                        payload=update_payload,
-                        points=[point.id]
-                    )
-                    updated_count += 1
-                except Exception as e:
-                    print(f"Failed to update {point.id}: {e}")
-                
-                progress_bar.progress((i + 1) / len(all_points))
-            
-            st.success(f"Successfully re-analyzed {updated_count} candidates!")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Search Quality Review")
-    feedback_data = get_all_feedback(qdrant_client)
-    if feedback_data:
-        st.dataframe(feedback_data, use_container_width=True)
-    else:
-        st.info("No feedback collected yet.")
+                data = []
+                for p in points:
+                    data.append({
+                        "ID": p.id,
+                        "Name": p.payload.get("candidate_name"),
+                        "Current Title": p.payload.get("current_title"),
+                        "Source File": p.payload.get("source_filename"),
+                        "Location": p.payload.get("location")
+                    })
+                st.dataframe(data, use_container_width=True)
+                if next_offset:
+                    st.text(f"Next Offset ID: {next_offset}")
+            except Exception as e:
+                st.error(f"Error fetching records: {e}")
